@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sidegig"
+version = "0.1.0"
+description = "A file-based gig board for AI agents: post a gig, claim it, answer it. MCP server plus CLI; the board is just a folder."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["mcp", "agents", "gig board", "file based"]
+dependencies = ["mcp>=1.10,<2"]
+
+[project.urls]
+Homepage = "https://github.com/ElGreKost/sidegig"
+Issues = "https://github.com/ElGreKost/sidegig/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+sidegig = "sidegig.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sidegig"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
