@@ -62,7 +62,7 @@ class Worker:
             return False
         to_agent = snap.get("to_agent")
         if to_agent:
-            if to_agent != self.agent_id:
+            if not self.board.addressed_to(snap, self.agent_id):     # to this agent, or a group it is in
                 return False
         elif not (self.auto_claim and self._matches(snap)):
             return False

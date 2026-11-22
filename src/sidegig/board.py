@@ -79,15 +79,71 @@ def check_answer(meta: Dict[str, Any], is_open: bool, thread: str) -> Dict[str, 
 
 class Board:
     def __init__(self, root, *, clock: Optional[Callable[[], float]] = None,
-                 claim_stale_s: float = 600, give_up_s: float = 3600, beat_min_s: float = 60):
-        """clock returns epoch seconds (inject it in tests)."""
+                 claim_stale_s: float = 600, give_up_s: float = 3600, beat_min_s: float = 60,
+                 members: Optional[Callable[[], Dict[str, List[str]]]] = None):
+        """clock returns epoch seconds (inject it in tests). claim_stale_s: a claim with no heartbeat
+        for this long may be taken over. give_up_s: a claim this old (heartbeats or not) with no
+        answer is given up (the lease). members: returns {group: [agent ids]}; groups exist only
+        when it is given (the hosted server reads them from members.json)."""
         self.root = Path(root)
         self.clock = clock or time.time
         self.claim_stale_s = claim_stale_s
         self.give_up_s = give_up_s
         self.beat_min_s = beat_min_s
+        self.members = members
+        self.members_problem: Callable[[], str] = lambda: ""
         self.warnings: List[str] = []
         self._last_scan: List[Dict[str, Any]] = []
+
+    def limits(self) -> Dict[str, int]:
+        """The claim timings, for board_info."""
+        return {"claim_stale_minutes": int(self.claim_stale_s // 60), "give_up_minutes": int(self.give_up_s // 60)}
+
+    def give_up_text(self) -> str:
+        if self.give_up_s == 3600:
+            return GIVE_UP_TEXT
+        return (f"{P.GIVE_UP_PREFIX}{int(self.give_up_s // 60)} minutes: the worker is busy or offline. "
+                "This gig is open for other workers.")
+
+    # ------------------------------------------------------------------ groups
+    def groups(self) -> Dict[str, List[str]]:
+        """{group: [agent ids]} ({} when the board has no groups or the members file is unreadable)."""
+        if self.members is None:
+            return {}
+        try:
+            return self.members() or {}
+        except Exception:     # a broken members source must not break the board: no groups
+            return {}
+
+    def group_members(self, group: str) -> List[str]:
+        """The members of a group; Invalid when groups are off or the group is unknown."""
+        if self.members is None:
+            raise Invalid(f"{group!r} names a group, and this board has no groups",
+                          "groups are defined in members.json on a hosted sidegig server; address one agent id instead")
+        groups = self.groups()
+        if group not in groups:
+            known = ", ".join(sorted(groups)) or "none"
+            problem = self.members_problem()
+            raise Invalid(f"unknown group {group!r}",
+                          f"known groups: {known}" + (f" ({problem})" if problem else "")
+                          + ". Ask the board operator to add it to members.json, or address one agent id.")
+        return list(groups[group])
+
+    def groups_of(self, agent_id: str) -> List[str]:
+        return sorted(g for g, ids in self.groups().items() if agent_id in ids)
+
+    def addressed_to(self, meta: Dict[str, Any], agent_id: str) -> bool:
+        """True when the gig is addressed to agent_id itself or to a group it belongs to."""
+        to = meta.get("to_agent")
+        if not to or not agent_id:
+            return False
+        return to == agent_id or (P.is_group(to) and agent_id in self.groups().get(to, []))
+
+    def recipients(self, to: Optional[str]) -> List[str]:
+        """The agent ids a to_agent value stands for (a group's members, or the one agent)."""
+        if not to:
+            return []
+        return list(self.groups().get(to, [])) if P.is_group(to) else [to]
 
     # ------------------------------------------------------------------ paths and time
     @property
@@ -502,7 +558,7 @@ class Board:
         elif lock is not None:
             if now - P.parse_iso(lock["at"]) >= self.give_up_s:
                 if self._evict_lock(d, lock):
-                    fsio.append_text(tp, P.status_line(lock["agent"], self._dt(), GIVE_UP_TEXT))
+                    fsio.append_text(tp, P.status_line(lock["agent"], self._dt(), self.give_up_text()))
                     changes = {"status": "stale", "claimed_by": None, "claimed_at": None}
                 lock = None
             elif (status, meta.get("claimed_by"), meta.get("claimed_at")) != ("claimed", lock["agent"], lock["at"]):
@@ -550,7 +606,10 @@ class Board:
             raise Invalid("title is empty", "give the gig a one-line title")
         refuse_secrets(title, text)
         to_agent = (to_agent or "").strip() or None
-        if to_agent:
+        if to_agent and P.is_group(to_agent):
+            to_agent = to_agent.lower()
+            self.group_members(to_agent)
+        elif to_agent:
             self._agent(to_agent)
         asker = _one_line(asker, 80) or "anonymous"
         now = self.clock()
@@ -575,7 +634,7 @@ class Board:
     def gigs(self, status: Optional[str] = None, tag: Optional[str] = None, for_agent: Optional[str] = None,
              asker: Optional[str] = None, refresh: bool = True) -> List[Dict[str, Any]]:
         """Snapshots, newest first. status may also be 'available' (open or stale);
-        for_agent keeps gigs addressed to that agent or to nobody."""
+        for_agent keeps gigs addressed to that agent (or a group it is in) or to nobody."""
         snaps = self.scan() if refresh else list(self._last_scan)
         want_tag = P.slugify(tag, 30, "") if tag else ""
         out = []
@@ -587,7 +646,7 @@ class Board:
                 continue
             if want_tag and want_tag not in g.get("tags", []):
                 continue
-            if for_agent and g.get("to_agent") not in (None, for_agent):
+            if for_agent and g.get("to_agent") and not self.addressed_to(g, for_agent):
                 continue
             if asker and str(g.get("asker", "")).lower() != asker.lower():
                 continue
@@ -633,7 +692,10 @@ class Board:
         if not snap["open"]:
             raise Conflict("nothing to answer: the last block of the thread is an answer",
                            "add a follow-up with gig_followup to open it again")
-        if snap.get("to_agent") and snap["to_agent"] != agent_id:
+        if snap.get("to_agent") and not self.addressed_to(snap, agent_id):
+            if P.is_group(snap["to_agent"]):
+                raise Conflict(f"gig is addressed to the group {snap['to_agent']} and {agent_id} is not a member",
+                               "only members of that group can claim it; the board operator manages members.json")
             raise Conflict(f"gig is addressed to {snap['to_agent']}",
                            "only that agent can claim it; post a new gig if it is not available")
         tp = Path(snap["thread_file"])
@@ -738,7 +800,8 @@ class Board:
         prof = self._agent(agent_id)
         tp = Path(snap["thread_file"])
         answers = P.parse_answers(fsio.read_text(tp)[0])
-        speaker = snap.get("to_agent") or (answers[-1]["agent_id"] if answers else None)
+        to = snap.get("to_agent")
+        speaker = to if to and not P.is_group(to) else (answers[-1]["agent_id"] if answers else None)
         if speaker != agent_id:
             raise Conflict(f"{agent_id} is not in this conversation",
                            "only the agent that answered (or the addressed agent) can add a message")

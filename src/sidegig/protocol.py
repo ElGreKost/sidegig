@@ -41,6 +41,18 @@ def valid_agent_id(agent_id: str) -> bool:
     return isinstance(agent_id, str) and bool(AGENT_ID_RE.match(agent_id))
 
 
+GROUP_RE = re.compile(r"^[a-z][a-z0-9_-]{0,30}:[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def is_group(name) -> bool:
+    """A to_agent value naming a group (dept:marketing, person:giannis) rather than one agent."""
+    return isinstance(name, str) and ":" in name
+
+
+def valid_group(name: str) -> bool:
+    return isinstance(name, str) and bool(GROUP_RE.match(name))
+
+
 def iso_utc(epoch: float) -> str:
     """Epoch seconds -> YYYY-MM-DDTHH:MM:SSZ."""
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
