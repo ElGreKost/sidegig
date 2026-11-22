@@ -523,7 +523,7 @@ def build_remote_app(root, state, *, audit: bool = True, max_body: int = 64 * 10
                                           allowed_origins=[f"https://{h}" for h in allowed_hosts])
                 if allowed_hosts else TransportSecuritySettings(enable_dns_rebinding_protection=False))
     mcp = build_app(board=board, bound_identity=_request_agent, max_text=max_text, poll_s=poll_s,
-                    stateless_http=True, transport_security=security)
+                    stateless_http=True, transport_security=security, log_level="WARNING")
     inner = mcp.streamable_http_app()
     tool_names = {t.name for t in mcp._tool_manager.list_tools()}
     waits: Dict[str, int] = {}

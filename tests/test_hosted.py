@@ -201,6 +201,19 @@ def test_the_sweep_turns_a_give_up_into_an_event(hosted):
     run(hosted, sc, clock=clock)
 
 
+def test_one_agent_cannot_open_unlimited_gig_waits(hosted):
+    async def sc(call, get, client, app):
+        gid = (await call("kostis", "gig_post", title="Slow one", to_agent="dev"))["gig_id"]
+        open_waits = [asyncio.create_task(call("kostis", "gig_wait", gig_id=gid, timeout_s=1)) for _ in range(4)]
+        await asyncio.sleep(0.2)
+        fifth = await call("kostis", "gig_wait", gig_id=gid, timeout_s=1)
+        assert not fifth["ok"] and "already open" in fifth["error"]
+        assert (await call("giannis", "gig_wait", gig_id=gid, timeout_s=0))["timed_out"]   # others are not affected
+        assert all(r["timed_out"] for r in await asyncio.gather(*open_waits))
+        assert (await call("kostis", "gig_wait", gig_id=gid, timeout_s=0))["timed_out"]    # slots are given back
+    run(hosted, sc)
+
+
 def test_state_folder_inside_the_board_is_refused(hosted):
     with pytest.raises(ValueError, match="inside the board"):
         build_remote_app(hosted["root"], hosted["root"] / "_state")
