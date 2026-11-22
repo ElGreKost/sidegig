@@ -16,17 +16,19 @@ HDRS = {"Accept": "application/json, text/event-stream", "Content-Type": "applic
 def setup(tmp_path):
     root = tmp_path / "board"
     Board(root).init("remote test")
-    store = TokenStore(tmp_path / "secret" / "tokens.json")
+    state = tmp_path / "state"
+    store = TokenStore(state / "tokens.json")
     toks = {}
     for aid in ("kostis", "giannis", "marketing", "dev", "w1", "w2", "w3", "w4", "w5", "w6"):
         Board(root).ensure_agent(aid, name=aid)
         toks[aid] = store.issue(aid, label="test")
-    return {"root": root, "store": store, "tokens": toks, "audit": tmp_path / "audit.jsonl", "tmp": tmp_path}
+    return {"root": root, "state": state, "store": store, "tokens": toks, "audit": state / "audit.jsonl",
+            "tmp": tmp_path}
 
 
 def run(setup, scenario, **kw):
     """Build the app, run its lifespan, hand scenario a call(token, tool, **args) helper."""
-    app = build_remote_app(setup["root"], setup["store"].path, audit_path=setup["audit"], poll_s=0.05, **kw)
+    app = build_remote_app(setup["root"], setup["state"], poll_s=0.05, **kw)
 
     async def main():
         async with app.lifespan():
@@ -165,7 +167,7 @@ def test_a_standard_mcp_client_connects_with_its_token(setup):
     """The official MCP client (what Claude Code speaks): initialize, list tools, call one, over HTTP."""
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
-    app = build_remote_app(setup["root"], setup["store"].path)
+    app = build_remote_app(setup["root"], setup["state"])
 
     async def main():
         async with app.lifespan():

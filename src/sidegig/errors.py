@@ -19,3 +19,9 @@ class Conflict(BoardError):
 
 class Invalid(BoardError):
     """The request itself is malformed (empty text, bad id, bad rating, ...)."""
+
+
+class Refused(BoardError):
+    """A hosted board refused the caller (token missing, unknown or revoked; wrong host name).
+    Retrying cannot help, so loops stop on it."""
+    fatal = True
