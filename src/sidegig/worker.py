@@ -1,8 +1,9 @@
 """The worker loop behind the sidegig worker command.
 
-Every few seconds: scan the board, claim gigs addressed to this agent (or matching its
-skills with auto-claim), keep heartbeats going, refresh _status/<id>.txt, and print ONE
-stdout line per event for an agent harness to watch (flushed):
+Every few seconds (on a hosted board: whenever an event arrives, at least every 25 s): scan the
+board, claim gigs addressed to this agent or to a group it is in (or matching its skills with
+auto-claim), keep heartbeats going, refresh _status/<id>.txt, and print ONE stdout line per
+event for an agent harness to watch (flushed):
 
     NEW <gig_id> <thread path>      newly claimed
     RESUME <gig_id> <thread path>   already claimed before a restart (printed once)
@@ -143,6 +144,8 @@ class Worker:
                 try:
                     self.step()
                 except (BoardError, OSError) as exc:
+                    if getattr(exc, "fatal", False):       # a hosted board refused the token: stop
+                        raise
                     self.err(f"warning: scan failed: {exc}")
                 if once:
                     break
