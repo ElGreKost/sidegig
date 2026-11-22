@@ -102,6 +102,9 @@ def test_a_client_resumes_after_a_server_restart(hosted):
         stale_boot = await get("dev", "/v1/events", after=cursor, wait=0, boot="00000000")
         assert stale_boot["events"][0]["type"] == "posted"         # an unknown boot replays from the start
     run(hosted, second)
+    for name in ("events.jsonl", "audit.jsonl", "tokens.json"):    # only the server's user can read them
+        assert stat.S_IMODE(os.stat(hosted["state"] / name).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(hosted["state"]).st_mode) == 0o700
 
 
 # ---------------------------------------------------------------------- HTTP API

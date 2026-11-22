@@ -65,6 +65,13 @@ def _log(msg: str) -> None:
     print(f"sidegig serve: {msg}", file=sys.stderr, flush=True)
 
 
+def _append_private(path: Path, text: str) -> None:
+    """Append to a file that only the server's user can read (created with mode 600)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(text)
+
+
 # ---------------------------------------------------------------------- events
 class EventBus:
     """Numbered events with async waiters, kept in an append-only JSONL file so they survive a restart.
@@ -129,7 +136,8 @@ class EventBus:
         tmp = self.path.with_name(f".{self.path.name}.{secrets.token_hex(4)}.tmp")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as f:
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(json.dumps({"sidegig_events": 1, "epoch": epoch}) + "\n")
                 for ev in self.ring:
                     f.write(json.dumps(ev, ensure_ascii=False) + "\n")
@@ -144,8 +152,7 @@ class EventBus:
         if self.path is None:
             return
         try:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            _append_private(self.path, line + "\n")
         except OSError as exc:
             self._warn("append", exc)
 
@@ -343,8 +350,7 @@ class AuditLog:
                 with contextlib.suppress(FileNotFoundError):
                     if os.path.getsize(self.path) > self.max_bytes:
                         os.replace(self.path, self.path.with_name(self.path.name + ".1"))
-                with open(self.path, "a", encoding="utf-8") as f:
-                    f.write(line)
+                _append_private(self.path, line)
         except OSError:
             pass   # the audit log must never take the board down
 
@@ -358,6 +364,8 @@ def _summary(path: str, body: bytes) -> Dict[str, Any]:
     if path.startswith("/v1/call/"):
         out: Dict[str, Any] = {"tool": path[len("/v1/call/"):][:60]}
         args = msg if isinstance(msg, dict) else {}
+    elif path.startswith("/v1/"):
+        return {}
     else:
         if not isinstance(msg, dict):
             return {"rpc": "batch" if isinstance(msg, list) else "?"}
