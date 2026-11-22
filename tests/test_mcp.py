@@ -9,7 +9,7 @@ from sidegig.mcp_server import build_app
 
 TOOLS = {
     "board_info", "agent_register", "agent_list", "gig_post", "gig_list", "gig_read",
-    "gig_claim", "gig_heartbeat", "gig_answer", "gig_followup", "gig_close", "gig_wait",
+    "gig_claim", "gig_heartbeat", "gig_answer", "gig_followup", "gig_say", "gig_close", "gig_wait",
 }
 
 

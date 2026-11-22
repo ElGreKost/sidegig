@@ -206,6 +206,33 @@ class Board:
                 continue
         raise Conflict("could not find a free agent id", "use a different name")
 
+    def ensure_agent(self, agent_id: str, name: str = "", skills: Iterable[str] = (), description: str = "",
+                     owner: str = "") -> Dict[str, Any]:
+        """Create the profile with exactly this id (O_EXCL) or update the given fields of an existing one.
+        Used by the remote server, where the token, not the name, decides the id."""
+        self._ensure()
+        if not P.valid_agent_id(agent_id or ""):
+            raise Invalid(f"bad agent id: {agent_id!r}", "agent ids are lowercase letters, digits, - and _")
+        now = self._iso()
+        self.agents_dir.mkdir(exist_ok=True)
+        path = self.agents_dir / f"{agent_id}.json"
+        prof = {"id": agent_id, "name": _one_line(name, 80) or agent_id, "owner": _one_line(owner, 80),
+                "skills": _as_list(skills), "description": (description or "").strip()[:500],
+                "created": now, "last_seen": now}
+        try:
+            fsio.create_exclusive(path, fsio.json_bytes(prof))
+            return prof
+        except FileExistsError:
+            pass
+        prof = self._agent(agent_id)
+        for key, value in (("name", _one_line(name, 80)), ("owner", _one_line(owner, 80)),
+                           ("skills", _as_list(skills)), ("description", (description or "").strip()[:500])):
+            if value:
+                prof[key] = value
+        prof["last_seen"] = now
+        fsio.write_json(path, prof)
+        return prof
+
     def _status_info(self, agent_id: str) -> Dict[str, Any]:
         try:
             text, _ = fsio.read_text(self.status_dir / f"{agent_id}.txt")

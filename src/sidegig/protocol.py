@@ -63,9 +63,14 @@ def status_line(agent_id: str, when: datetime, text: str) -> str:
     return f"[{agent_id}] {when:%H:%M} {text}"
 
 
+MSG_HEAD_RE = re.compile(r"^-----\s.*·.*-----\s*$")
+
+
 def sanitize_body(text: str) -> str:
-    """Neutralise lines that start with the 20-char rule, so a body cannot fake a marker."""
-    return "\n".join((" " + ln) if ln.startswith(RULE) else ln for ln in normalize(text).split("\n"))
+    """Neutralise lines that start with the 20-char rule or look like a message header, so a body
+    cannot fake a marker or a message from somebody else."""
+    return "\n".join((" " + ln) if ln.startswith(RULE) or MSG_HEAD_RE.match(ln) else ln
+                     for ln in normalize(text).split("\n"))
 
 
 def message_block(author: str, when: datetime, text: str) -> str:

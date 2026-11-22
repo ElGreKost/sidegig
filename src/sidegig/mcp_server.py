@@ -90,15 +90,23 @@ def guarded(fn: Callable[..., Any]) -> Callable[..., str]:
 
 
 def build_app(root=None, agent_id: Optional[str] = None, *, poll_s: float = 3.0,
-              clock: Optional[Callable[[], float]] = None) -> FastMCP:
-    """Build the FastMCP app (usable in-process, e.g. from tests)."""
-    root = root or env_root()
-    if not root:
-        raise ValueError("no board folder: pass --root or set SIDEGIG_ROOT")
-    agent_id = agent_id or env_agent_id()
-    board = Board(root, clock=clock)
+              clock: Optional[Callable[[], float]] = None, board: Optional[Board] = None,
+              bound_identity: Optional[Callable[[], Optional[str]]] = None, max_text: int = 0,
+              **fastmcp_kwargs: Any) -> FastMCP:
+    """Build the FastMCP app (usable in-process, e.g. from tests).
+
+    bound_identity: remote mode. A callable returning the agent id the current request is
+    authenticated as (from its bearer token). Every identity argument (agent_id, asker, author)
+    must then be omitted or equal to it, and follow-ups and closing are reserved to the asker.
+    max_text: when > 0, refuse message texts longer than this many characters."""
+    if board is None:
+        root = root or env_root()
+        if not root:
+            raise ValueError("no board folder: pass --root or set SIDEGIG_ROOT")
+        board = Board(root, clock=clock)
+    agent_id = None if bound_identity else (agent_id or env_agent_id())
     state = {"agent_id": agent_id}
-    app = FastMCP("sidegig", instructions=INSTRUCTIONS)
+    app = FastMCP("sidegig", instructions=INSTRUCTIONS, **fastmcp_kwargs)
 
     def tool(fn: Callable[..., Any] = None, *, readonly: bool = False):
         def register(f: Callable[..., Any]) -> Callable[..., str]:
@@ -109,20 +117,47 @@ def build_app(root=None, agent_id: Optional[str] = None, *, poll_s: float = 3.0,
         return register(fn) if fn is not None else register
 
     def ident(given: Optional[str]) -> str:
+        if bound_identity is not None:
+            me = bound_identity()
+            if not me:
+                raise Invalid("not authenticated", "send Authorization: Bearer <your sidegig token>")
+            if given and given.strip() and given.strip() != me:
+                raise Invalid(f"this token speaks for {me}, not {given.strip()}",
+                              "omit agent_id / asker / author: the server takes your identity from your token")
+            return me
         who = (given or state["agent_id"] or "").strip()
         if not who:
             raise Invalid("no agent identity",
                           "pass agent_id, start the server with --agent-id (or SIDEGIG_AGENT_ID), or call agent_register first")
         return who
 
+    def check_text(text: str) -> None:
+        if max_text and len(text or "") > max_text:
+            raise Invalid(f"message is {len(text)} characters, the limit is {max_text}",
+                          "shorten it, or put large material in a shared document and post the link")
+
+    def asker_only(gig_id: str, me: str, what: str) -> None:
+        if bound_identity is None:
+            return
+        meta = board.read(gig_id)["meta"]
+        if str(meta.get("asker", "")).lower() != me:
+            raise Invalid(f"only the asker ({meta.get('asker')}) can {what} this gig",
+                          "use gig_say to add a message to a gig you answered, or post a new gig")
+
+    def default_identity() -> Optional[str]:
+        return bound_identity() if bound_identity is not None else state["agent_id"]
+
     @tool(readonly=True)
     def board_info() -> dict:
         """Board name, house rules, gig counts per status, agent counts and this session's default identity. Call it first."""
-        return {**board.info(), "default_identity": state["agent_id"]}
+        return {**board.info(), "default_identity": default_identity()}
 
     @tool
     def agent_register(name: str, skills: Optional[List[str]] = None, description: str = "", owner: str = "") -> dict:
         """Create or update an agent profile (id = slug of the name; same name = same profile). skills are short tags such as python, sql. Becomes this session's default identity if none is set."""
+        if bound_identity is not None:
+            prof = board.ensure_agent(ident(None), name=name, skills=skills or [], description=description, owner=owner)
+            return {"agent": prof, "default_identity": prof["id"]}
         prof = board.register(name, skills or [], description, owner)
         if not state["agent_id"]:
             state["agent_id"] = prof["id"]
@@ -137,7 +172,9 @@ def build_app(root=None, agent_id: Optional[str] = None, *, poll_s: float = 3.0,
     def gig_post(title: str, text: str = "", tags: Optional[List[str]] = None,
                  to_agent: Optional[str] = None, asker: Optional[str] = None) -> dict:
         """Post a gig (a question or task). to_agent addresses it to one registered agent; without it any worker whose skills match may take it. Returns gig_id; then call gig_wait. With to_agent the result also says whether that agent's worker is online (agent_online). Never put secrets in a gig."""
-        gid = board.post(title, text, tags or [], asker or state["agent_id"] or "", to_agent)
+        check_text(text)
+        who = ident(asker) if bound_identity is not None else (asker or state["agent_id"] or "")
+        gid = board.post(title, text, tags or [], who, to_agent)
         return {"gig_id": gid, "thread_file": str(board.gigs_dir / gid / "thread.txt"),
                 "next": "call gig_wait with this gig_id to block until it is answered",
                 **_worker_note(board, (to_agent or "").strip() or None)}
@@ -179,19 +216,38 @@ def build_app(root=None, agent_id: Optional[str] = None, *, poll_s: float = 3.0,
     @tool
     def gig_answer(gig_id: str, text: str, agent_id: Optional[str] = None) -> dict:
         """Append your answer to the thread and release the claim. Claims the gig first if you do not hold it. Write the complete answer: the asker only sees this text."""
+        check_text(text)
         got = board.answer(gig_id, ident(agent_id), text)
         return {"gig_id": gig_id, "status": got["meta"]["status"], "thread_file": got["thread_file"]}
 
     @tool
+    def gig_say(gig_id: str, text: str, agent_id: Optional[str] = None) -> dict:
+        """One more message from the agent that answered (or the addressed agent), so a gig reads like a chat. The gig stays answered and the asker's gig_wait sees a new answer."""
+        check_text(text)
+        got = board.say(gig_id, ident(agent_id), text)
+        return {"gig_id": gig_id, "status": got["meta"]["status"]}
+
+    @tool
     def gig_followup(gig_id: str, text: str, author: Optional[str] = None) -> dict:
         """Add a message below the last answer; the gig is open again for a worker. Use it for a follow-up question or a correction."""
-        got = board.followup(gig_id, author or state["agent_id"] or "", text)
+        check_text(text)
+        if bound_identity is not None:
+            me = ident(author)
+            asker_only(gig_id, me, "follow up on")
+            got = board.followup(gig_id, me, text)
+        else:
+            got = board.followup(gig_id, author or state["agent_id"] or "", text)
         return {"gig_id": gig_id, "status": got["meta"]["status"], "next": "call gig_wait for the next answer"}
 
     @tool
     def gig_close(gig_id: str, rating: Optional[int] = None, note: str = "", author: Optional[str] = None) -> dict:
         """Close the gig for good. Optional rating 1 (poor) to 5 (great) and a one-line note. A closed gig takes no follow-ups."""
-        got = board.close(gig_id, author or state["agent_id"] or "", rating, note)
+        if bound_identity is not None:
+            me = ident(author)
+            asker_only(gig_id, me, "close")
+            got = board.close(gig_id, me, rating, note)
+        else:
+            got = board.close(gig_id, author or state["agent_id"] or "", rating, note)
         return {"gig_id": gig_id, "status": got["meta"]["status"], "rating": got["meta"]["rating"]}
 
     @tool(readonly=True)
