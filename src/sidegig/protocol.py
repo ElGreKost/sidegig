@@ -107,6 +107,25 @@ def is_open(thread: str) -> bool:
     return bool(open_text(thread))
 
 
+STATUS_PARTS_RE = re.compile(r"^\s*\[(?P<id>[a-z0-9][a-z0-9_-]*)\] \d{2}:\d{2} (?P<text>.*)$")
+GIVE_UP_PREFIX = "No answer after "
+
+
+def last_holder(thread: str):
+    """The agent that picked up the open part of the thread (after the last END OF ANSWER) and
+    has not given up since, or None. A new claimer that finds one is taking over from it."""
+    holder = None
+    for line in _after_last_end(normalize(thread)).split("\n"):
+        m = STATUS_PARTS_RE.match(line)
+        if not m:
+            continue
+        if m["text"].startswith(PICKUP_TEXT[:10]):
+            holder = m["id"]
+        elif m["text"].startswith((GIVE_UP_PREFIX, "Closed by ")):
+            holder = None
+    return holder
+
+
 def has_answer(thread: str) -> bool:
     return bool(END_RE.search(normalize(thread)))
 

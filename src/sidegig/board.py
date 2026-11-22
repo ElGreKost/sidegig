@@ -20,6 +20,7 @@ from .guide import guide_text
 FORMAT = 1
 STATUSES = ("open", "claimed", "answered", "closed", "stale")
 LOCK_NAME = "claim.lock"
+EVICT_NAME = LOCK_NAME + ".evict"   # held (O_EXCL) by the one process allowed to evict claim.lock
 GIVE_UP_TEXT = "No answer after 60 minutes: the worker is busy or offline. This gig is open for other workers."
 _COMPUTED = ("open", "thread_file", "sig", "beat", "claim_stale")
 _GARBAGE_LOCK_S = 30  # an unreadable lock older than this (real seconds) is removed
@@ -365,8 +366,12 @@ class Board:
     # locks
     def _read_lock(self, d: Path) -> Optional[Dict[str, Any]]:
         """None: no lock. {}: a lock that cannot be read yet (being written) or is garbage."""
+        return self._parse_lock(d / LOCK_NAME)
+
+    @staticmethod
+    def _parse_lock(path: Path) -> Optional[Dict[str, Any]]:
         try:
-            data = fsio.read_json(d / LOCK_NAME)
+            data = fsio.read_json(path)
         except FileNotFoundError:
             return None
         except (OSError, ValueError):
@@ -387,30 +392,71 @@ class Board:
             return 0.0
 
     def _evict_lock(self, d: Path, expected: Optional[Dict[str, Any]]) -> bool:
-        """Remove a lock atomically (rename away). True only for the one caller that removed it.
+        """Remove a lock the caller judged stale (expected) or garbage (expected None).
+        True only for the one caller that removed it.
 
-        If the lock that was moved is not the one the caller judged stale (someone refreshed or
-        replaced it in between), it is put back and False is returned.
+        Evictions are serialised by a second O_EXCL file, claim.lock.evict. Only its holder may
+        move claim.lock away, and it reads the lock again first: a taker whose view is out of date
+        (another taker already evicted the stale lock and made a fresh one) finds the fresh lock
+        and stops, so it never moves somebody's live lock away. Without the gate, that taker
+        renamed the new holder's lock, a third taker created its own lock in the gap, the
+        put-back failed and two takers both won.
+
+        Between the re-read and the rename only the lock's own holder can change it (a heartbeat
+        that arrives in that instant, after 10 silent minutes). Then the moved lock is restored
+        with O_EXCL, best effort, and False is returned; if somebody claimed the free slot in
+        between, that one holds the gig and the late holder learns it at its next heartbeat.
         """
-        lock = d / LOCK_NAME
-        tomb = d / f"{LOCK_NAME}.{secrets.token_hex(4)}.gone"
+        gate = d / EVICT_NAME
+        mark = secrets.token_hex(8)
         try:
-            os.rename(lock, tomb)
-        except (FileNotFoundError, PermissionError):
+            fsio.create_exclusive(gate, mark.encode("ascii"))
+        except FileExistsError:
+            self._clear_dead_gate(gate)
+            return False
+        except OSError:
             return False
         try:
-            moved = fsio.read_json(tomb)
-        except (OSError, ValueError):
-            moved = None
-        if expected is not None and moved != expected and moved is not None:
+            current = self._read_lock(d)
+            if expected is None:
+                if current != {} or self._lock_age(d) <= _GARBAGE_LOCK_S:
+                    return False
+            elif current != expected:
+                return False
+            lock = d / LOCK_NAME
+            tomb = d / f"{LOCK_NAME}.{secrets.token_hex(4)}.gone"
             try:
-                fsio.create_exclusive(lock, fsio.json_bytes(moved))
+                os.rename(lock, tomb)
+            except (FileNotFoundError, PermissionError):
+                return False
+            moved = self._parse_lock(tomb)
+            if moved and moved != expected:      # replaced in the instant before the rename
+                try:
+                    fsio.create_exclusive(lock, fsio.json_bytes(moved))
+                except OSError:
+                    pass
+                _unlink(tomb)
+                return False
+            _unlink(tomb)
+            return True
+        finally:
+            try:
+                if gate.read_bytes() == mark.encode("ascii"):
+                    _unlink(gate)
             except OSError:
                 pass
+
+    def _clear_dead_gate(self, gate: Path) -> None:
+        """An eviction gate left by a process that died mid-eviction (older than 30 s) is removed;
+        the caller retries later. A live gate is held for milliseconds."""
+        try:
+            if time.time() - os.path.getmtime(gate) <= _GARBAGE_LOCK_S:
+                return
+            tomb = gate.with_name(f"{gate.name}.{secrets.token_hex(4)}.gone")
+            os.rename(gate, tomb)
             _unlink(tomb)
-            return False
-        _unlink(tomb)
-        return True
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ scan
     def _snap(self, meta: Dict[str, Any], tp: Path, is_open: bool, sig: str, lock: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -620,8 +666,11 @@ class Board:
                 time.sleep(random.uniform(0.005, 0.04))
         else:
             raise Conflict("could not take the claim (busy)", "retry in a few seconds")
-        if took is None and not resumed and snap.get("claim_stale") and snap.get("claimed_by") not in (None, agent_id):
-            took = snap["claimed_by"]       # another thread evicted the stale lock, but we won the new one
+        if took is None and not resumed:
+            # Another taker may have evicted the stale lock and we won the free slot; the thread
+            # still names the agent that picked it up (snap may already show no claim at all).
+            prev = P.last_holder(fsio.read_text(tp)[0])
+            took = prev if prev not in (None, agent_id) else None
         meta = self._update_meta(d, status="claimed", claimed_by=agent_id, claimed_at=payload["at"])
         if not resumed:
             dt = datetime.fromtimestamp(now)

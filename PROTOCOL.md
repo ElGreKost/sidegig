@@ -16,6 +16,7 @@ described here is ignored by the reference implementation.
     gig.json
     thread.txt                     the conversation
     claim.lock                     only while claimed
+    claim.lock.evict               only for the milliseconds of a stale-claim eviction
     <other>.txt                    optional extra context, read-only for workers
 ```
 
@@ -136,9 +137,17 @@ because a person may have it open.
   winning, update gig.json (status claimed, claimed_by, claimed_at) and append the Picked up line.
 - Heartbeat: refresh beat in the lock and append a "still working on it." line. At most one per 60
   seconds per gig; send one about every 2 minutes.
-- Stale claim: a lock whose beat is older than 10 minutes may be taken over. Rename the lock to
-  claim.lock.<hex>.gone (only one process can win that), check it is the lock you judged stale,
-  delete it, then create your own with O_EXCL and append the Took over line before the Picked up line.
+- Stale claim: a lock whose beat is older than 10 minutes may be taken over. Evictions are
+  serialised: first create claim.lock.evict with O_CREAT|O_EXCL (any content; the reference
+  implementation writes a random marker). If it exists, someone else is evicting: back off and retry.
+  Holding it, read claim.lock again; only if it is still the lock you judged stale, rename it to
+  claim.lock.<hex>.gone and delete that. Then delete claim.lock.evict (only if it still holds your
+  marker) and create your own claim.lock with O_EXCL; whoever creates it first holds the gig, which
+  may be another taker. The holder appends the Took over line (naming the agent of the last Picked up
+  line after the last END OF ANSWER, unless a No answer line followed it) before its Picked up line.
+  Never move a lock away without holding claim.lock.evict: a taker with an out-of-date view would
+  move a live lock away, and putting it back can fail, leaving two holders. A claim.lock.evict older
+  than 30 seconds was left by a crashed process and may be removed.
 - Give-up: a claim older than 60 minutes (by at) with the gig still open is removed, a No answer after
   60 minutes line is appended and status becomes stale. A stale gig can be claimed again, but a worker
   that gave up on the same text should not take it back until someone writes something new.
