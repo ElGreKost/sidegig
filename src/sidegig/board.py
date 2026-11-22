@@ -16,6 +16,7 @@ from . import fsio
 from . import protocol as P
 from .errors import Conflict, Invalid, NotFound
 from .guide import guide_text
+from .secretscan import refuse_secrets
 
 FORMAT = 1
 STATUSES = ("open", "claimed", "answered", "closed", "stale")
@@ -179,6 +180,7 @@ class Board:
         name = _one_line(name, 80)
         if not name:
             raise Invalid("agent name is empty", "pass a short descriptive name")
+        refuse_secrets(name, description, owner)
         skills = _as_list(skills)
         description = (description or "").strip()[:500]
         owner = _one_line(owner, 80)
@@ -214,6 +216,7 @@ class Board:
         self._ensure()
         if not P.valid_agent_id(agent_id or ""):
             raise Invalid(f"bad agent id: {agent_id!r}", "agent ids are lowercase letters, digits, - and _")
+        refuse_secrets(name, description, owner)
         now = self._iso()
         self.agents_dir.mkdir(exist_ok=True)
         path = self.agents_dir / f"{agent_id}.json"
@@ -545,6 +548,7 @@ class Board:
         title = _one_line(title, 200)
         if not title:
             raise Invalid("title is empty", "give the gig a one-line title")
+        refuse_secrets(title, text)
         to_agent = (to_agent or "").strip() or None
         if to_agent:
             self._agent(to_agent)
@@ -705,6 +709,7 @@ class Board:
         the caller does not hold it yet (and nobody else does)."""
         if not (text or "").strip():
             raise Invalid("answer text is empty", "write the answer")
+        refuse_secrets(text)
         got = self.claim(gig_id, agent_id)
         d = self._gig_dir(gig_id)
         tp = Path(got["thread_file"])
@@ -721,6 +726,7 @@ class Board:
         the gig is addressed to) may speak while nobody has asked anything new."""
         if not (text or "").strip():
             raise Invalid("message text is empty", "write the message")
+        refuse_secrets(text)
         d = self._gig_dir(gig_id)
         snap = self._refresh(d)
         if snap is None:
@@ -748,6 +754,7 @@ class Board:
         self._ensure()
         if not (text or "").strip():
             raise Invalid("follow-up text is empty", "write the message")
+        refuse_secrets(text)
         author = _one_line(author, 80) or "anonymous"
         d = self._gig_dir(gig_id)
         snap = self._refresh(d)
@@ -772,6 +779,7 @@ class Board:
             raise Invalid(f"rating must be a whole number from 1 to 5, got {rating!r}", "use 1 (poor) to 5 (great), or omit it")
         author = _one_line(author, 80) or "anonymous"
         note = _one_line(note, 500)
+        refuse_secrets(note)
         d = self._gig_dir(gig_id)
         snap = self._refresh(d)
         if snap is None:
