@@ -16,10 +16,12 @@ from . import fsio
 from . import protocol as P
 from .errors import Conflict, Invalid, NotFound
 from .guide import guide_text
+from .secretscan import refuse_secrets
 
 FORMAT = 1
 STATUSES = ("open", "claimed", "answered", "closed", "stale")
 LOCK_NAME = "claim.lock"
+EVICT_NAME = LOCK_NAME + ".evict"   # held (O_EXCL) by the one process allowed to evict claim.lock
 GIVE_UP_TEXT = "No answer after 60 minutes: the worker is busy or offline. This gig is open for other workers."
 _COMPUTED = ("open", "thread_file", "sig", "beat", "claim_stale")
 _GARBAGE_LOCK_S = 30  # an unreadable lock older than this (real seconds) is removed
@@ -77,15 +79,71 @@ def check_answer(meta: Dict[str, Any], is_open: bool, thread: str) -> Dict[str, 
 
 class Board:
     def __init__(self, root, *, clock: Optional[Callable[[], float]] = None,
-                 claim_stale_s: float = 600, give_up_s: float = 3600, beat_min_s: float = 60):
-        """clock returns epoch seconds (inject it in tests)."""
+                 claim_stale_s: float = 600, give_up_s: float = 3600, beat_min_s: float = 60,
+                 members: Optional[Callable[[], Dict[str, List[str]]]] = None):
+        """clock returns epoch seconds (inject it in tests). claim_stale_s: a claim with no heartbeat
+        for this long may be taken over. give_up_s: a claim this old (heartbeats or not) with no
+        answer is given up (the lease). members: returns {group: [agent ids]}; groups exist only
+        when it is given (the hosted server reads them from members.json)."""
         self.root = Path(root)
         self.clock = clock or time.time
         self.claim_stale_s = claim_stale_s
         self.give_up_s = give_up_s
         self.beat_min_s = beat_min_s
+        self.members = members
+        self.members_problem: Callable[[], str] = lambda: ""
         self.warnings: List[str] = []
         self._last_scan: List[Dict[str, Any]] = []
+
+    def limits(self) -> Dict[str, int]:
+        """The claim timings, for board_info."""
+        return {"claim_stale_minutes": int(self.claim_stale_s // 60), "give_up_minutes": int(self.give_up_s // 60)}
+
+    def give_up_text(self) -> str:
+        if self.give_up_s == 3600:
+            return GIVE_UP_TEXT
+        return (f"{P.GIVE_UP_PREFIX}{int(self.give_up_s // 60)} minutes: the worker is busy or offline. "
+                "This gig is open for other workers.")
+
+    # ------------------------------------------------------------------ groups
+    def groups(self) -> Dict[str, List[str]]:
+        """{group: [agent ids]} ({} when the board has no groups or the members file is unreadable)."""
+        if self.members is None:
+            return {}
+        try:
+            return self.members() or {}
+        except Exception:     # a broken members source must not break the board: no groups
+            return {}
+
+    def group_members(self, group: str) -> List[str]:
+        """The members of a group; Invalid when groups are off or the group is unknown."""
+        if self.members is None:
+            raise Invalid(f"{group!r} names a group, and this board has no groups",
+                          "groups are defined in members.json on a hosted sidegig server; address one agent id instead")
+        groups = self.groups()
+        if group not in groups:
+            known = ", ".join(sorted(groups)) or "none"
+            problem = self.members_problem()
+            raise Invalid(f"unknown group {group!r}",
+                          f"known groups: {known}" + (f" ({problem})" if problem else "")
+                          + ". Ask the board operator to add it to members.json, or address one agent id.")
+        return list(groups[group])
+
+    def groups_of(self, agent_id: str) -> List[str]:
+        return sorted(g for g, ids in self.groups().items() if agent_id in ids)
+
+    def addressed_to(self, meta: Dict[str, Any], agent_id: str) -> bool:
+        """True when the gig is addressed to agent_id itself or to a group it belongs to."""
+        to = meta.get("to_agent")
+        if not to or not agent_id:
+            return False
+        return to == agent_id or (P.is_group(to) and agent_id in self.groups().get(to, []))
+
+    def recipients(self, to: Optional[str]) -> List[str]:
+        """The agent ids a to_agent value stands for (a group's members, or the one agent)."""
+        if not to:
+            return []
+        return list(self.groups().get(to, [])) if P.is_group(to) else [to]
 
     # ------------------------------------------------------------------ paths and time
     @property
@@ -178,6 +236,7 @@ class Board:
         name = _one_line(name, 80)
         if not name:
             raise Invalid("agent name is empty", "pass a short descriptive name")
+        refuse_secrets(name, description, owner)
         skills = _as_list(skills)
         description = (description or "").strip()[:500]
         owner = _one_line(owner, 80)
@@ -205,6 +264,34 @@ class Board:
             except FileExistsError:
                 continue
         raise Conflict("could not find a free agent id", "use a different name")
+
+    def ensure_agent(self, agent_id: str, name: str = "", skills: Iterable[str] = (), description: str = "",
+                     owner: str = "") -> Dict[str, Any]:
+        """Create the profile with exactly this id (O_EXCL) or update the given fields of an existing one.
+        Used by the remote server, where the token, not the name, decides the id."""
+        self._ensure()
+        if not P.valid_agent_id(agent_id or ""):
+            raise Invalid(f"bad agent id: {agent_id!r}", "agent ids are lowercase letters, digits, - and _")
+        refuse_secrets(name, description, owner)
+        now = self._iso()
+        self.agents_dir.mkdir(exist_ok=True)
+        path = self.agents_dir / f"{agent_id}.json"
+        prof = {"id": agent_id, "name": _one_line(name, 80) or agent_id, "owner": _one_line(owner, 80),
+                "skills": _as_list(skills), "description": (description or "").strip()[:500],
+                "created": now, "last_seen": now}
+        try:
+            fsio.create_exclusive(path, fsio.json_bytes(prof))
+            return prof
+        except FileExistsError:
+            pass
+        prof = self._agent(agent_id)
+        for key, value in (("name", _one_line(name, 80)), ("owner", _one_line(owner, 80)),
+                           ("skills", _as_list(skills)), ("description", (description or "").strip()[:500])):
+            if value:
+                prof[key] = value
+        prof["last_seen"] = now
+        fsio.write_json(path, prof)
+        return prof
 
     def _status_info(self, agent_id: str) -> Dict[str, Any]:
         try:
@@ -338,8 +425,12 @@ class Board:
     # locks
     def _read_lock(self, d: Path) -> Optional[Dict[str, Any]]:
         """None: no lock. {}: a lock that cannot be read yet (being written) or is garbage."""
+        return self._parse_lock(d / LOCK_NAME)
+
+    @staticmethod
+    def _parse_lock(path: Path) -> Optional[Dict[str, Any]]:
         try:
-            data = fsio.read_json(d / LOCK_NAME)
+            data = fsio.read_json(path)
         except FileNotFoundError:
             return None
         except (OSError, ValueError):
@@ -360,30 +451,71 @@ class Board:
             return 0.0
 
     def _evict_lock(self, d: Path, expected: Optional[Dict[str, Any]]) -> bool:
-        """Remove a lock atomically (rename away). True only for the one caller that removed it.
+        """Remove a lock the caller judged stale (expected) or garbage (expected None).
+        True only for the one caller that removed it.
 
-        If the lock that was moved is not the one the caller judged stale (someone refreshed or
-        replaced it in between), it is put back and False is returned.
+        Evictions are serialised by a second O_EXCL file, claim.lock.evict. Only its holder may
+        move claim.lock away, and it reads the lock again first: a taker whose view is out of date
+        (another taker already evicted the stale lock and made a fresh one) finds the fresh lock
+        and stops, so it never moves somebody's live lock away. Without the gate, that taker
+        renamed the new holder's lock, a third taker created its own lock in the gap, the
+        put-back failed and two takers both won.
+
+        Between the re-read and the rename only the lock's own holder can change it (a heartbeat
+        that arrives in that instant, after 10 silent minutes). Then the moved lock is restored
+        with O_EXCL, best effort, and False is returned; if somebody claimed the free slot in
+        between, that one holds the gig and the late holder learns it at its next heartbeat.
         """
-        lock = d / LOCK_NAME
-        tomb = d / f"{LOCK_NAME}.{secrets.token_hex(4)}.gone"
+        gate = d / EVICT_NAME
+        mark = secrets.token_hex(8)
         try:
-            os.rename(lock, tomb)
-        except (FileNotFoundError, PermissionError):
+            fsio.create_exclusive(gate, mark.encode("ascii"))
+        except FileExistsError:
+            self._clear_dead_gate(gate)
+            return False
+        except OSError:
             return False
         try:
-            moved = fsio.read_json(tomb)
-        except (OSError, ValueError):
-            moved = None
-        if expected is not None and moved != expected and moved is not None:
+            current = self._read_lock(d)
+            if expected is None:
+                if current != {} or self._lock_age(d) <= _GARBAGE_LOCK_S:
+                    return False
+            elif current != expected:
+                return False
+            lock = d / LOCK_NAME
+            tomb = d / f"{LOCK_NAME}.{secrets.token_hex(4)}.gone"
             try:
-                fsio.create_exclusive(lock, fsio.json_bytes(moved))
+                os.rename(lock, tomb)
+            except (FileNotFoundError, PermissionError):
+                return False
+            moved = self._parse_lock(tomb)
+            if moved and moved != expected:      # replaced in the instant before the rename
+                try:
+                    fsio.create_exclusive(lock, fsio.json_bytes(moved))
+                except OSError:
+                    pass
+                _unlink(tomb)
+                return False
+            _unlink(tomb)
+            return True
+        finally:
+            try:
+                if gate.read_bytes() == mark.encode("ascii"):
+                    _unlink(gate)
             except OSError:
                 pass
+
+    def _clear_dead_gate(self, gate: Path) -> None:
+        """An eviction gate left by a process that died mid-eviction (older than 30 s) is removed;
+        the caller retries later. A live gate is held for milliseconds."""
+        try:
+            if time.time() - os.path.getmtime(gate) <= _GARBAGE_LOCK_S:
+                return
+            tomb = gate.with_name(f"{gate.name}.{secrets.token_hex(4)}.gone")
+            os.rename(gate, tomb)
             _unlink(tomb)
-            return False
-        _unlink(tomb)
-        return True
+        except OSError:
+            pass
 
     # ------------------------------------------------------------------ scan
     def _snap(self, meta: Dict[str, Any], tp: Path, is_open: bool, sig: str, lock: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -426,7 +558,7 @@ class Board:
         elif lock is not None:
             if now - P.parse_iso(lock["at"]) >= self.give_up_s:
                 if self._evict_lock(d, lock):
-                    fsio.append_text(tp, P.status_line(lock["agent"], self._dt(), GIVE_UP_TEXT))
+                    fsio.append_text(tp, P.status_line(lock["agent"], self._dt(), self.give_up_text()))
                     changes = {"status": "stale", "claimed_by": None, "claimed_at": None}
                 lock = None
             elif (status, meta.get("claimed_by"), meta.get("claimed_at")) != ("claimed", lock["agent"], lock["at"]):
@@ -472,8 +604,12 @@ class Board:
         title = _one_line(title, 200)
         if not title:
             raise Invalid("title is empty", "give the gig a one-line title")
+        refuse_secrets(title, text)
         to_agent = (to_agent or "").strip() or None
-        if to_agent:
+        if to_agent and P.is_group(to_agent):
+            to_agent = to_agent.lower()
+            self.group_members(to_agent)
+        elif to_agent:
             self._agent(to_agent)
         asker = _one_line(asker, 80) or "anonymous"
         now = self.clock()
@@ -498,7 +634,7 @@ class Board:
     def gigs(self, status: Optional[str] = None, tag: Optional[str] = None, for_agent: Optional[str] = None,
              asker: Optional[str] = None, refresh: bool = True) -> List[Dict[str, Any]]:
         """Snapshots, newest first. status may also be 'available' (open or stale);
-        for_agent keeps gigs addressed to that agent or to nobody."""
+        for_agent keeps gigs addressed to that agent (or a group it is in) or to nobody."""
         snaps = self.scan() if refresh else list(self._last_scan)
         want_tag = P.slugify(tag, 30, "") if tag else ""
         out = []
@@ -510,7 +646,7 @@ class Board:
                 continue
             if want_tag and want_tag not in g.get("tags", []):
                 continue
-            if for_agent and g.get("to_agent") not in (None, for_agent):
+            if for_agent and g.get("to_agent") and not self.addressed_to(g, for_agent):
                 continue
             if asker and str(g.get("asker", "")).lower() != asker.lower():
                 continue
@@ -556,7 +692,10 @@ class Board:
         if not snap["open"]:
             raise Conflict("nothing to answer: the last block of the thread is an answer",
                            "add a follow-up with gig_followup to open it again")
-        if snap.get("to_agent") and snap["to_agent"] != agent_id:
+        if snap.get("to_agent") and not self.addressed_to(snap, agent_id):
+            if P.is_group(snap["to_agent"]):
+                raise Conflict(f"gig is addressed to the group {snap['to_agent']} and {agent_id} is not a member",
+                               "only members of that group can claim it; the board operator manages members.json")
             raise Conflict(f"gig is addressed to {snap['to_agent']}",
                            "only that agent can claim it; post a new gig if it is not available")
         tp = Path(snap["thread_file"])
@@ -593,8 +732,11 @@ class Board:
                 time.sleep(random.uniform(0.005, 0.04))
         else:
             raise Conflict("could not take the claim (busy)", "retry in a few seconds")
-        if took is None and not resumed and snap.get("claim_stale") and snap.get("claimed_by") not in (None, agent_id):
-            took = snap["claimed_by"]       # another thread evicted the stale lock, but we won the new one
+        if took is None and not resumed:
+            # Another taker may have evicted the stale lock and we won the free slot; the thread
+            # still names the agent that picked it up (snap may already show no claim at all).
+            prev = P.last_holder(fsio.read_text(tp)[0])
+            took = prev if prev not in (None, agent_id) else None
         meta = self._update_meta(d, status="claimed", claimed_by=agent_id, claimed_at=payload["at"])
         if not resumed:
             dt = datetime.fromtimestamp(now)
@@ -629,6 +771,7 @@ class Board:
         the caller does not hold it yet (and nobody else does)."""
         if not (text or "").strip():
             raise Invalid("answer text is empty", "write the answer")
+        refuse_secrets(text)
         got = self.claim(gig_id, agent_id)
         d = self._gig_dir(gig_id)
         tp = Path(got["thread_file"])
@@ -645,6 +788,7 @@ class Board:
         the gig is addressed to) may speak while nobody has asked anything new."""
         if not (text or "").strip():
             raise Invalid("message text is empty", "write the message")
+        refuse_secrets(text)
         d = self._gig_dir(gig_id)
         snap = self._refresh(d)
         if snap is None:
@@ -656,7 +800,8 @@ class Board:
         prof = self._agent(agent_id)
         tp = Path(snap["thread_file"])
         answers = P.parse_answers(fsio.read_text(tp)[0])
-        speaker = snap.get("to_agent") or (answers[-1]["agent_id"] if answers else None)
+        to = snap.get("to_agent")
+        speaker = to if to and not P.is_group(to) else (answers[-1]["agent_id"] if answers else None)
         if speaker != agent_id:
             raise Conflict(f"{agent_id} is not in this conversation",
                            "only the agent that answered (or the addressed agent) can add a message")
@@ -672,6 +817,7 @@ class Board:
         self._ensure()
         if not (text or "").strip():
             raise Invalid("follow-up text is empty", "write the message")
+        refuse_secrets(text)
         author = _one_line(author, 80) or "anonymous"
         d = self._gig_dir(gig_id)
         snap = self._refresh(d)
@@ -696,6 +842,7 @@ class Board:
             raise Invalid(f"rating must be a whole number from 1 to 5, got {rating!r}", "use 1 (poor) to 5 (great), or omit it")
         author = _one_line(author, 80) or "anonymous"
         note = _one_line(note, 500)
+        refuse_secrets(note)
         d = self._gig_dir(gig_id)
         snap = self._refresh(d)
         if snap is None:

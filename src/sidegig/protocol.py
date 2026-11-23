@@ -41,6 +41,18 @@ def valid_agent_id(agent_id: str) -> bool:
     return isinstance(agent_id, str) and bool(AGENT_ID_RE.match(agent_id))
 
 
+GROUP_RE = re.compile(r"^[a-z][a-z0-9_-]{0,30}:[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+def is_group(name) -> bool:
+    """A to_agent value naming a group (dept:marketing, person:dave) rather than one agent."""
+    return isinstance(name, str) and ":" in name
+
+
+def valid_group(name: str) -> bool:
+    return isinstance(name, str) and bool(GROUP_RE.match(name))
+
+
 def iso_utc(epoch: float) -> str:
     """Epoch seconds -> YYYY-MM-DDTHH:MM:SSZ."""
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -63,9 +75,14 @@ def status_line(agent_id: str, when: datetime, text: str) -> str:
     return f"[{agent_id}] {when:%H:%M} {text}"
 
 
+MSG_HEAD_RE = re.compile(r"^-----\s.*·.*-----\s*$")
+
+
 def sanitize_body(text: str) -> str:
-    """Neutralise lines that start with the 20-char rule, so a body cannot fake a marker."""
-    return "\n".join((" " + ln) if ln.startswith(RULE) else ln for ln in normalize(text).split("\n"))
+    """Neutralise lines that start with the 20-char rule or look like a message header, so a body
+    cannot fake a marker or a message from somebody else."""
+    return "\n".join((" " + ln) if ln.startswith(RULE) or MSG_HEAD_RE.match(ln) else ln
+                     for ln in normalize(text).split("\n"))
 
 
 def message_block(author: str, when: datetime, text: str) -> str:
@@ -100,6 +117,25 @@ def open_text(thread: str) -> str:
 def is_open(thread: str) -> bool:
     """True when the thread has text that still needs an answer."""
     return bool(open_text(thread))
+
+
+STATUS_PARTS_RE = re.compile(r"^\s*\[(?P<id>[a-z0-9][a-z0-9_-]*)\] \d{2}:\d{2} (?P<text>.*)$")
+GIVE_UP_PREFIX = "No answer after "
+
+
+def last_holder(thread: str):
+    """The agent that picked up the open part of the thread (after the last END OF ANSWER) and
+    has not given up since, or None. A new claimer that finds one is taking over from it."""
+    holder = None
+    for line in _after_last_end(normalize(thread)).split("\n"):
+        m = STATUS_PARTS_RE.match(line)
+        if not m:
+            continue
+        if m["text"].startswith(PICKUP_TEXT[:10]):
+            holder = m["id"]
+        elif m["text"].startswith((GIVE_UP_PREFIX, "Closed by ")):
+            holder = None
+    return holder
 
 
 def has_answer(thread: str) -> bool:
