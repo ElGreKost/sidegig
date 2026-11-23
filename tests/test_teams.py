@@ -321,6 +321,25 @@ def test_a_removed_team_takes_its_tokens_with_it(teams):
     run(teams, sc)
 
 
+def test_two_teams_can_never_share_a_board_folder(teams):
+    state = teams["state"]
+    acme_board = TeamStore(state).board_path("acme")
+    for board in (acme_board, acme_board / "gigs", state / "teams" / "globex"):
+        with pytest.raises(Exception, match="overlaps the folders of team"):
+            create_team(state, "copycat", "Copycat", "cat", board=board)
+    assert TeamStore(state).get("copycat") is None
+    # a hand-edited teams.json that points two teams at one board: both are refused, not merged
+    path = state / "teams.json"
+    data = json.loads(path.read_text())
+    data["teams"]["globex"]["board"] = os.path.relpath(acme_board, state)
+    path.write_text(json.dumps(data))
+
+    async def sc(call, mcp, req, events, app):
+        for who in ("acme-carol", "globex-carol"):
+            assert (await req("POST", "/v1/call/gig_list", who, json={})).status_code == 503
+    run(teams, sc)
+
+
 def test_admin_credential_loading(tmp_path):
     cred = tmp_path / "admin.cred"
     cred.write_text(ADMIN_CRED + "\n")

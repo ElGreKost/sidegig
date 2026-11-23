@@ -462,6 +462,8 @@ class Hub:
     def _load(self, team: str, path: Path) -> TeamState:
         if inside(self.state, path):
             raise ValueError("the state folder is inside this team's board folder")
+        if self.teams.sharing(team, path):
+            raise ValueError("this team's board folder overlaps another team's folders")
         Board(path)._ensure()
         tdir = self.teams.team_dir(team)
         tdir.mkdir(parents=True, exist_ok=True)

@@ -138,6 +138,18 @@ class TeamStore:
             raise Invalid(f"the state folder is inside the board folder {board}: keep tokens out of the board",
                           "use a board folder that does not contain the state folder")
 
+    def sharing(self, team: str, board: Path, teams: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+        """The id of another team whose board or team folder overlaps board (one inside the other,
+        or the same folder), else "". Two teams on one board would see each other's gigs."""
+        teams = self._load_admin() if teams is None else teams
+        for other, rec in sorted(teams.items()):
+            if other == team or not isinstance(rec, dict):
+                continue
+            for folder in (self.board_path(other, rec), self.team_dir(other)):
+                if inside(board, folder) or inside(folder, board):
+                    return other
+        return ""
+
     # ------------------------------------------------------------------ changes
     def _save(self, teams: Dict[str, Dict[str, Any]]) -> None:
         write_private_json(self.path, {"format": FORMAT, "teams": teams})
@@ -155,6 +167,10 @@ class TeamStore:
             teams = {k: dict(v) for k, v in self._load_admin().items()}
             if team in teams:
                 raise Conflict(f"team {team!r} exists already", "pick another id, or list them: sidegig team list")
+            other = self.sharing(team, board_path, teams)
+            if other:
+                raise Conflict(f"that board folder overlaps the folders of team {other!r}",
+                               "every team needs its own board folder, outside the other teams' folders")
             tdir.mkdir(parents=True, exist_ok=True)
             os.chmod(tdir, 0o700)
             if init and not (board_path / "board.json").is_file():
