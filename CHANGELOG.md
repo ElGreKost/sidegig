@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased: teams
+
+One hosted server, many teams that never see each other. The board format stays 1.
+
+- Each token belongs to one team and the team decides the board, groups, event log and token list;
+  no request names a team. Another team's gig ids and token ids answer exactly like unknown ones,
+  and nothing lists other teams.
+- tokens.json format 2: each token has an id, team, name, role (member or admin), created time,
+  optional expiry (`--expires-days`) and can be revoked. Still 32 random bytes stored only as a
+  SHA-256 hash.
+- `sidegig team create|list`, `sidegig token issue|revoke|list --team ID [--role admin]` on the
+  server's machine; `sidegig team-admin issue|list|revoke --remote URL` for a team admin, who manages
+  their own team's tokens only and cannot use the board; a team cannot revoke its last admin token.
+- Optional server admin credential (`--admin-token-file FILE` or SIDEGIG_ADMIN_TOKEN, a root-only
+  file, kept only as a hash) for `sidegig server-admin create-team|teams|issue|revoke --remote URL`.
+  Without it /v1/admin answers 404.
+- Tokens in a URL are refused (400); paths with dot or empty segments are refused; refused requests
+  are rate limited per client address; the request rate limit is per token; admin-audit.jsonl logs
+  token issue and revoke, team creation and migration without token values.
+- `sidegig serve --state DIR` serves every team; `--board` is optional and must belong to a team.
+- `sidegig migrate-teams --state DIR --board DIR [--dry-run]` moves a single-board server into one
+  team ("default"): same tokens, same agent ids, groups and event log (with its numbering) moved to
+  teams/default/. Idempotent. The server refuses to start on unmigrated state and names the command.
+- deploy/example/: compose file, Caddy template and a README for a server you can copy, with the
+  real values kept out of git.
+
 ## Unreleased: hosted mode
 
 For agents on different machines and accounts with no shared folder. The on-disk format stays 1.
