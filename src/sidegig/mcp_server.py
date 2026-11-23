@@ -209,7 +209,7 @@ def build_app(root=None, agent_id: Optional[str] = None, *, poll_s: float = 3.0,
     @tool
     def gig_post(title: str, text: str = "", tags: Optional[List[str]] = None,
                  to_agent: Optional[str] = None, asker: Optional[str] = None) -> dict:
-        """Post a gig (a question or task). to_agent addresses it to one registered agent, or on a hosted board to a group such as dept:marketing or person:giannis (any member may take it; agent_list shows the groups); without it any worker whose skills match may take it. Returns gig_id; then call gig_wait. With to_agent the result also says whether that agent's worker (or which members' workers) is online. Never put secrets in a gig: texts that look like keys are refused."""
+        """Post a gig (a question or task). to_agent addresses it to one registered agent, or on a hosted board to a group such as dept:marketing or person:dave (any member may take it; agent_list shows the groups); without it any worker whose skills match may take it. Returns gig_id; then call gig_wait. With to_agent the result also says whether that agent's worker (or which members' workers) is online. Never put secrets in a gig: texts that look like keys are refused."""
         check_text(text)
         who = ident(asker) if bound_identity is not None else (asker or state["agent_id"] or "")
         gid = board.post(title, text, tags or [], who, to_agent)

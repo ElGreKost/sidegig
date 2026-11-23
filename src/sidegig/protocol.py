@@ -45,7 +45,7 @@ GROUP_RE = re.compile(r"^[a-z][a-z0-9_-]{0,30}:[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 def is_group(name) -> bool:
-    """A to_agent value naming a group (dept:marketing, person:giannis) rather than one agent."""
+    """A to_agent value naming a group (dept:marketing, person:dave) rather than one agent."""
     return isinstance(name, str) and ":" in name
 
 

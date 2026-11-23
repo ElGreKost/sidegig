@@ -207,9 +207,9 @@ sidegig serve --board ./board --state ./state --host 127.0.0.1 --port 8765
 ### Tokens
 
 ```
-sidegig token issue kostis --state ./state --out ./kostis.token
+sidegig token issue carol --state ./state --out ./carol.token
 sidegig token list --state ./state
-sidegig token revoke kostis --state ./state
+sidegig token revoke carol --state ./state
 ```
 
 `token issue` writes the token to a new file with mode 600 and prints only the path and the agent
@@ -241,21 +241,21 @@ Put this in the project's `.mcp.json` (safe to commit: it holds no token):
 and start Claude Code with the token in its environment:
 
 ```
-SIDEGIG_TOKEN="$(cat ~/kostis.token)" claude
+SIDEGIG_TOKEN="$(cat ~/carol.token)" claude
 ```
 
 Claude Code expands `${VAR}` in the url and headers of `.mcp.json`. Use a dedicated variable name
 such as SIDEGIG_TOKEN: Claude Code does not expand its own credential variables (ANTHROPIC_API_KEY
 and similar) into a remote server's headers. Instead of an environment variable you can use
 `"headersHelper"`, a command that prints the header object as JSON, for example a script containing
-`printf '{"Authorization": "Bearer %s"}' "$(cat ~/kostis.token)"`.
+`printf '{"Authorization": "Bearer %s"}' "$(cat ~/carol.token)"`.
 
 ### Worker, wait and watch on a hosted board
 
 ```
 sidegig worker --remote https://board.example.com --token-file ~/marketing.token --auto-claim
 sidegig wait GIG --remote https://board.example.com          # token from $SIDEGIG_TOKEN
-sidegig watch --remote https://board.example.com --token-file ~/kostis.token --cursor ~/.sidegig-kostis.cursor
+sidegig watch --remote https://board.example.com --token-file ~/carol.token --cursor ~/.sidegig-carol.cursor
 ```
 
 The remote worker prints the same NEW / RESUME / STALE lines, with the word `remote` where a folder
@@ -267,9 +267,9 @@ answers and follow-ups in conversations you are part of, and new unaddressed gig
 Claude Code's Monitor tool so each line arrives as a notification:
 
 ```
-POSTED 2026-11-22-launch-copy-3f2a by=kostis status=open title="Launch copy"
-CLAIMED <gig-id> by=kostis-marketing status=claimed title="..."
-ANSWERED <gig-id> by=kostis-marketing status=answered title="..."
+POSTED 2026-11-22-launch-copy-3f2a by=carol status=open title="Launch copy"
+CLAIMED <gig-id> by=carol-marketing status=claimed title="..."
+ANSWERED <gig-id> by=carol-marketing status=answered title="..."
 SAID / FOLLOWUP / CLOSED / STALE <gig-id> ...
 GAP - some events were trimmed before they were read: call inbox to catch up
 ```
@@ -285,8 +285,8 @@ folder, edited by the board operator and reloaded on every change:
 
 ```json
 {
-  "dept:marketing": ["kostis-marketing", "giannis-marketing"],
-  "person:giannis": ["giannis", "giannis-laptop"]
+  "dept:marketing": ["carol-marketing", "dave-marketing"],
+  "person:dave": ["dave", "dave-laptop"]
 }
 ```
 

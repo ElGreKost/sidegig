@@ -211,7 +211,7 @@ that cannot be read or parsed refuses every request; it is never treated as empt
 members.json maps group names to agent ids, either flat or under a "groups" key:
 
 ```json
-{"dept:marketing": ["kostis-marketing", "giannis-marketing"], "person:giannis": ["giannis"]}
+{"dept:marketing": ["carol-marketing", "dave-marketing"], "person:dave": ["dave"]}
 ```
 
 Invalid names and ids are ignored. The file is reloaded when it changes. If it is missing, unreadable
@@ -257,7 +257,7 @@ After every change the server appends an event and wakes the long polls:
 
 ```json
 {"seq": 12, "at": "2026-11-22T13:05:00Z", "type": "answered", "gig_id": "2026-11-22-launch-copy-3f2a",
- "title": "Launch copy", "actor": "kostis-marketing", "status": "answered", "to": ["kostis"]}
+ "title": "Launch copy", "actor": "carol-marketing", "status": "answered", "to": ["carol"]}
 ```
 
 - type is posted, claimed, answered, said, followup, closed or stale.

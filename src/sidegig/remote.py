@@ -7,7 +7,7 @@ and FastMCP runs the (synchronous) board tools one at a time on its event loop. 
 (outside the board, never readable by agents) holds:
 
     tokens.json    SHA-256 hashes of the agent tokens (sidegig token issue/revoke/list)
-    members.json   groups: {"dept:marketing": ["kostis-marketing", ...]} (optional, hand-edited)
+    members.json   groups: {"dept:marketing": ["carol-marketing", ...]} (optional, hand-edited)
     events.jsonl   the event log: survives restarts, compacted to the newest events
     audit.jsonl    one line per request: who, which tool, which gig, status (never text or tokens)
 

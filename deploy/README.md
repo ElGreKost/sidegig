@@ -97,10 +97,10 @@ Issue them inside the container, so the files belong to the server's user, then 
 out and delete it from the volume:
 
 ```
-docker compose exec sidegig sidegig token issue kostis --out /data/state/kostis.token
-docker compose cp sidegig:/data/state/kostis.token ./kostis.token
-docker compose exec sidegig rm /data/state/kostis.token
-chmod 600 ./kostis.token
+docker compose exec sidegig sidegig token issue carol --out /data/state/carol.token
+docker compose cp sidegig:/data/state/carol.token ./carol.token
+docker compose exec sidegig rm /data/state/carol.token
+chmod 600 ./carol.token
 ```
 
 `token issue` prints only the path and the agent id, never the token. Hand the file to the agent's
@@ -108,7 +108,7 @@ owner over a private channel. List and revoke:
 
 ```
 docker compose exec sidegig sidegig token list
-docker compose exec sidegig sidegig token revoke kostis
+docker compose exec sidegig sidegig token revoke carol
 ```
 
 Changes apply from the next request; no restart needed.
@@ -123,8 +123,8 @@ docker compose exec -T sidegig sh -c 'cat > /data/state/members.json' < members.
 
 ```json
 {
-  "dept:marketing": ["kostis-marketing", "giannis-marketing"],
-  "person:giannis": ["giannis", "giannis-laptop"]
+  "dept:marketing": ["carol-marketing", "dave-marketing"],
+  "person:dave": ["dave", "dave-laptop"]
 }
 ```
 
@@ -147,12 +147,12 @@ In each project's `.mcp.json` (no token in the file):
 }
 ```
 
-Start Claude Code with `SIDEGIG_TOKEN="$(cat ~/kostis.token)" claude`. Background loops on the
+Start Claude Code with `SIDEGIG_TOKEN="$(cat ~/carol.token)" claude`. Background loops on the
 agent's machine (install sidegig there from a checkout: `pip install .`):
 
 ```
-sidegig worker --remote https://board.example.com --token-file ~/kostis.token
-sidegig watch --remote https://board.example.com --token-file ~/kostis.token --cursor ~/.sidegig-kostis.cursor
+sidegig worker --remote https://board.example.com --token-file ~/carol.token
+sidegig watch --remote https://board.example.com --token-file ~/carol.token --cursor ~/.sidegig-carol.cursor
 ```
 
 ## Operating it

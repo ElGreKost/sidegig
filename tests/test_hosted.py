@@ -19,7 +19,7 @@ from sidegig.remote import EventBus, build_remote_app
 from sidegig.tokens import TokenStore
 from sidegig.worker import Worker
 
-AGENTS = ("kostis", "giannis", "dev", "kostis-marketing", "giannis-marketing")
+AGENTS = ("carol", "dave", "dev", "carol-marketing", "dave-marketing")
 
 
 @pytest.fixture
@@ -29,8 +29,8 @@ def hosted(tmp_path):
     store = TokenStore(state / "tokens.json")
     toks = {aid: store.issue(aid, label="test") for aid in AGENTS}
     (state / "members.json").write_text(json.dumps({
-        "dept:marketing": ["kostis-marketing", "giannis-marketing"],
-        "person:giannis": ["giannis", "giannis-marketing"]}), "utf-8")
+        "dept:marketing": ["carol-marketing", "dave-marketing"],
+        "person:dave": ["dave", "dave-marketing"]}), "utf-8")
     return {"root": root, "state": state, "store": store, "tokens": toks, "tmp": tmp_path}
 
 
@@ -60,12 +60,12 @@ def test_events_survive_a_restart_and_numbering_continues(tmp_path):
     path = tmp_path / "events.jsonl"
     bus = EventBus(path, keep=10)
     for i in range(3):
-        bus.publish({"type": "posted", "gig_id": f"g{i}", "actor": "kostis", "to": ["dev"]})
+        bus.publish({"type": "posted", "gig_id": f"g{i}", "actor": "carol", "to": ["dev"]})
     boot = bus.boot
     again = EventBus(path, keep=10)
     assert again.boot == boot and again.seq == 3
     assert [e["gig_id"] for e in again.for_agent("dev", 1)] == ["g1", "g2"]
-    assert again.publish({"type": "answered", "gig_id": "g0", "actor": "dev", "to": ["kostis"]})["seq"] == 4
+    assert again.publish({"type": "answered", "gig_id": "g0", "actor": "dev", "to": ["carol"]})["seq"] == 4
 
 
 def test_a_torn_last_line_is_skipped_and_trimming_reports_a_gap(tmp_path):
@@ -88,7 +88,7 @@ def test_a_torn_last_line_is_skipped_and_trimming_reports_a_gap(tmp_path):
 
 def test_a_client_resumes_after_a_server_restart(hosted):
     async def first(call, get, client, app):
-        gid = (await call("kostis", "gig_post", title="Spec review", to_agent="dev"))["gig_id"]
+        gid = (await call("carol", "gig_post", title="Spec review", to_agent="dev"))["gig_id"]
         ev = await get("dev", "/v1/events", after=0, wait=0)
         return gid, ev["boot"], ev["next"]
     gid, boot, cursor = run(hosted, first)
@@ -96,7 +96,7 @@ def test_a_client_resumes_after_a_server_restart(hosted):
     async def second(call, get, client, app):
         assert (await get("dev", "/v1/events", after=cursor, wait=0, boot=boot))["events"] == []   # no replay
         await call("dev", "gig_answer", gig_id=gid, text="Looks good.")
-        ev = await get("kostis", "/v1/events", after=cursor, wait=0, boot=boot)
+        ev = await get("carol", "/v1/events", after=cursor, wait=0, boot=boot)
         assert [e["type"] for e in ev["events"]] == ["claimed", "answered"] and ev["boot"] == boot
         assert ev["events"][0]["seq"] == cursor + 1
         stale_boot = await get("dev", "/v1/events", after=cursor, wait=0, boot="00000000")
@@ -110,40 +110,40 @@ def test_a_client_resumes_after_a_server_restart(hosted):
 # ---------------------------------------------------------------------- HTTP API
 def test_v1_me_call_and_inbox(hosted):
     async def sc(call, get, client, app):
-        me = await get("giannis-marketing", "/v1/me")
-        assert me["agent"] == "giannis-marketing" and me["groups"] == ["dept:marketing", "person:giannis"]
+        me = await get("dave-marketing", "/v1/me")
+        assert me["agent"] == "dave-marketing" and me["groups"] == ["dept:marketing", "person:dave"]
         assert me["give_up_minutes"] == 240 and me["claim_stale_minutes"] == 10
-        gid = (await call("kostis", "gig_post", title="Launch copy", to_agent="dept:marketing"))["gig_id"]
-        box = await call("kostis-marketing", "inbox")
+        gid = (await call("carol", "gig_post", title="Launch copy", to_agent="dept:marketing"))["gig_id"]
+        box = await call("carol-marketing", "inbox")
         assert [g["id"] for g in box["to_answer"]] == [gid] and "notice" in box
-        spoof = await call("kostis-marketing", "inbox", agent_id="kostis")
-        assert not spoof["ok"] and "speaks for kostis-marketing" in spoof["error"]
+        spoof = await call("carol-marketing", "inbox", agent_id="carol")
+        assert not spoof["ok"] and "speaks for carol-marketing" in spoof["error"]
         r = await client.post("/v1/call/no_such_tool", json={},
                               headers={"Authorization": f"Bearer {hosted['tokens']['dev']}"})
         assert r.status_code == 404 and "gig_post" in r.json()["hint"]
         bad = await client.post("/v1/call/gig_read", json={"nope": 1},
                                 headers={"Authorization": f"Bearer {hosted['tokens']['dev']}"})
         assert bad.status_code == 400 and bad.json()["ok"] is False
-        await call("kostis-marketing", "gig_answer", gig_id=gid, text="Line one.")
-        assert [g["id"] for g in (await call("kostis", "inbox"))["answered"]] == [gid]
+        await call("carol-marketing", "gig_answer", gig_id=gid, text="Line one.")
+        assert [g["id"] for g in (await call("carol", "inbox"))["answered"]] == [gid]
     run(hosted, sc)
 
 
 def test_group_claims_over_the_network_and_group_events(hosted):
     async def sc(call, get, client, app):
-        gid = (await call("kostis", "gig_post", title="Launch copy", to_agent="dept:marketing"))["gig_id"]
-        for who in ("kostis-marketing", "giannis-marketing"):
+        gid = (await call("carol", "gig_post", title="Launch copy", to_agent="dept:marketing"))["gig_id"]
+        for who in ("carol-marketing", "dave-marketing"):
             assert [e["gig_id"] for e in (await get(who, "/v1/events", after=0, wait=0))["events"]] == [gid]
         assert (await get("dev", "/v1/events", after=0, wait=0))["events"] == []
         no = await call("dev", "gig_claim", gig_id=gid)
         assert not no["ok"] and no["code"] == "Conflict" and "not a member" in no["error"]
-        yes = await call("giannis-marketing", "gig_claim", gig_id=gid)
-        assert yes["ok"] and yes["meta"]["claimed_by"] == "giannis-marketing"
-        unknown = await call("kostis", "gig_post", title="x", to_agent="dept:sales")
+        yes = await call("dave-marketing", "gig_claim", gig_id=gid)
+        assert yes["ok"] and yes["meta"]["claimed_by"] == "dave-marketing"
+        unknown = await call("carol", "gig_post", title="x", to_agent="dept:sales")
         assert not unknown["ok"] and "unknown group 'dept:sales'" in unknown["error"]
         scan = await get("dev", "/v1/scan")
         assert gid not in [g["id"] for g in scan["gigs"]]                 # not dev's business
-        scan = await get("kostis-marketing", "/v1/scan")
+        scan = await get("carol-marketing", "/v1/scan")
         assert [g["for_me"] for g in scan["gigs"] if g["id"] == gid] == [True]
     run(hosted, sc)
 
@@ -189,13 +189,13 @@ def test_the_sweep_turns_a_give_up_into_an_event(hosted):
     clock = Clock()
 
     async def sc(call, get, client, app):
-        gid = (await call("kostis", "gig_post", title="Long job", to_agent="dev"))["gig_id"]
+        gid = (await call("carol", "gig_post", title="Long job", to_agent="dev"))["gig_id"]
         await call("dev", "gig_claim", gig_id=gid)
         app.board.sweep()                                          # takes stock
-        mark = (await get("kostis", "/v1/events", after=0, wait=0))["next"]
+        mark = (await get("carol", "/v1/events", after=0, wait=0))["next"]
         clock.advance(5 * 3600)
         assert app.board.sweep() == 1
-        ev = (await get("kostis", "/v1/events", after=mark, wait=0))["events"]
+        ev = (await get("carol", "/v1/events", after=mark, wait=0))["events"]
         assert [(e["type"], e["gig_id"]) for e in ev] == [("stale", gid)]
         assert [e["type"] for e in (await get("dev", "/v1/events", after=0, wait=0))["events"]][-1] == "stale"
     run(hosted, sc, clock=clock)
@@ -203,14 +203,14 @@ def test_the_sweep_turns_a_give_up_into_an_event(hosted):
 
 def test_one_agent_cannot_open_unlimited_gig_waits(hosted):
     async def sc(call, get, client, app):
-        gid = (await call("kostis", "gig_post", title="Slow one", to_agent="dev"))["gig_id"]
-        open_waits = [asyncio.create_task(call("kostis", "gig_wait", gig_id=gid, timeout_s=1)) for _ in range(4)]
+        gid = (await call("carol", "gig_post", title="Slow one", to_agent="dev"))["gig_id"]
+        open_waits = [asyncio.create_task(call("carol", "gig_wait", gig_id=gid, timeout_s=1)) for _ in range(4)]
         await asyncio.sleep(0.2)
-        fifth = await call("kostis", "gig_wait", gig_id=gid, timeout_s=1)
+        fifth = await call("carol", "gig_wait", gig_id=gid, timeout_s=1)
         assert not fifth["ok"] and "already open" in fifth["error"]
-        assert (await call("giannis", "gig_wait", gig_id=gid, timeout_s=0))["timed_out"]   # others are not affected
+        assert (await call("dave", "gig_wait", gig_id=gid, timeout_s=0))["timed_out"]   # others are not affected
         assert all(r["timed_out"] for r in await asyncio.gather(*open_waits))
-        assert (await call("kostis", "gig_wait", gig_id=gid, timeout_s=0))["timed_out"]    # slots are given back
+        assert (await call("carol", "gig_wait", gig_id=gid, timeout_s=0))["timed_out"]    # slots are given back
     run(hosted, sc)
 
 
@@ -242,7 +242,7 @@ def live(hosted):
 
 
 def test_remote_board_drives_the_worker_end_to_end(live):
-    asker = RemoteBoard(live["url"], live["tokens"]["kostis"])
+    asker = RemoteBoard(live["url"], live["tokens"]["carol"])
     dev = RemoteBoard(live["url"], live["tokens"]["dev"])
     out = []
     w = Worker(dev, "dev", out=out.append, err=lambda s: None, sleep=dev.idle, settle_s=0, scan_s=10)
@@ -257,7 +257,7 @@ def test_remote_board_drives_the_worker_end_to_end(live):
     thread = dev.call("gig_read", gig_id=gid)
     assert "Is the API right?" in thread["thread"] and "notice" in thread
     with pytest.raises(Conflict):
-        RemoteBoard(live["url"], live["tokens"]["giannis"]).claim(gid, "giannis")
+        RemoteBoard(live["url"], live["tokens"]["dave"]).claim(gid, "dave")
     dev.call("gig_answer", gig_id=gid, text="Yes, ship it.")
     st = wait_for_answer_remote(asker, gid, timeout_s=5)
     assert st["state"] == "answered" and st["answer"]["text"].strip() == "Yes, ship it."
@@ -271,22 +271,22 @@ def test_remote_board_drives_the_worker_end_to_end(live):
 
 
 def test_remote_group_worker_and_watch_lines(live):
-    asker = RemoteBoard(live["url"], live["tokens"]["kostis"])
-    km = RemoteBoard(live["url"], live["tokens"]["kostis-marketing"])
+    asker = RemoteBoard(live["url"], live["tokens"]["carol"])
+    km = RemoteBoard(live["url"], live["tokens"]["carol-marketing"])
     km.connect()
     gid = asker.call("gig_post", title="Launch\ncopy \x1b[31m", to_agent="dept:marketing")["gig_id"]
     out = []
-    w = Worker(km, "kostis-marketing", out=out.append, err=lambda s: None, sleep=km.idle, settle_s=0)
+    w = Worker(km, "carol-marketing", out=out.append, err=lambda s: None, sleep=km.idle, settle_s=0)
     w.start()
     w.step()
     assert out == [f"NEW {gid} remote"]
     lines = []
-    watcher = RemoteBoard(live["url"], live["tokens"]["kostis"])
+    watcher = RemoteBoard(live["url"], live["tokens"]["carol"])
     watch_remote(watcher, out=lines.append, once=True, cursor_file=str(live["tmp"] / "cur.json"))
     assert lines == []                                   # a fresh watcher starts at "now"
     km.call("gig_answer", gig_id=gid, text="Done.")
     watch_remote(watcher, out=lines.append, once=True, cursor_file=str(live["tmp"] / "cur.json"))
-    assert lines == [f'ANSWERED {gid} by=kostis-marketing status=answered title="Launch copy [31m"']   # no ESC
+    assert lines == [f'ANSWERED {gid} by=carol-marketing status=answered title="Launch copy [31m"']   # no ESC
     for rb in (asker, km, watcher):
         rb.close()
 
@@ -327,11 +327,11 @@ def test_token_issue_writes_a_private_file_and_never_prints_the_token(tmp_path, 
 
 
 def test_cli_wait_and_watch_against_a_live_server(live, monkeypatch, capsys, tmp_path):
-    monkeypatch.setenv("SIDEGIG_TOKEN", live["tokens"]["kostis"])
+    monkeypatch.setenv("SIDEGIG_TOKEN", live["tokens"]["carol"])
     tok_file = tmp_path / "dev.token"
     tok_file.write_text(live["tokens"]["dev"] + "\n")
     os.chmod(tok_file, 0o600)
-    gid = RemoteBoard(live["url"], live["tokens"]["kostis"]).call("gig_post", title="Quick one", to_agent="dev")["gig_id"]
+    gid = RemoteBoard(live["url"], live["tokens"]["carol"]).call("gig_post", title="Quick one", to_agent="dev")["gig_id"]
     assert cli_main(["worker", "--remote", live["url"], "--token-file", str(tok_file), "--once"]) == 0
     assert f"NEW {gid} remote" in capsys.readouterr().out
     RemoteBoard(live["url"], live["tokens"]["dev"]).call("gig_answer", gig_id=gid, text="Answer text.")

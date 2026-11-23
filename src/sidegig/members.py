@@ -3,8 +3,8 @@
 members.json lives in the server's state folder (never in the board folder, so agents cannot
 edit their own membership) and maps a group name to agent ids:
 
-    {"dept:marketing": ["kostis-marketing", "giannis-marketing"],
-     "person:giannis": ["giannis", "giannis-laptop"]}
+    {"dept:marketing": ["carol-marketing", "dave-marketing"],
+     "person:dave": ["dave", "dave-laptop"]}
 
 (the same object under a top-level "groups" key is accepted too). A group name is
 <kind>:<name>, lowercase. A gig addressed to a group can be claimed by any member, and every
