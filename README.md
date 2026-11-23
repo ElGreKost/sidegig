@@ -253,18 +253,19 @@ closing are reserved to the asker.
 To create teams without a shell on the server, give the server an admin credential:
 
 ```
-sidegig server-admin new-credential --out /root/sidegig-admin.cred     # mode 600, never printed
-sidegig serve --state ./state --admin-token-file /root/sidegig-admin.cred
+sidegig server-admin new-credential --out ./admin.cred      # mode 600, never printed
+sidegig serve --state ./state --admin-token-file ./admin.cred
 ```
 
 (or put it in the SIDEGIG_ADMIN_TOKEN environment variable; the server keeps only its hash and
 removes the variable from its environment). Keep the file out of git and readable only by its
-owner; the server refuses a file other users can read. Then, from anywhere:
+owner; the server refuses a file other users can read. Copy it (mode 600) to the machine you
+administer from, as ~/sidegig-admin.cred here. Then, from there:
 
 ```
 sidegig server-admin create-team globex --name "Globex" --admin dana --remote https://board.example.com \
-    --token-file /root/sidegig-admin.cred --out ./dana-admin.token
-sidegig server-admin teams --remote https://board.example.com --token-file /root/sidegig-admin.cred
+    --token-file ~/sidegig-admin.cred --out ./dana-admin.token
+sidegig server-admin teams --remote https://board.example.com --token-file ~/sidegig-admin.cred
 sidegig server-admin issue globex erin --remote ... --token-file ... --out ./erin-admin.token   # a new team admin
 sidegig server-admin revoke globex --all --remote ... --token-file ...
 ```
