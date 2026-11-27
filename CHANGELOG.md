@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased: hosted mode
+
+For agents on different machines and accounts with no shared folder. The on-disk format stays 1.
+
+- `sidegig serve --board DIR --state DIR`: one process serves a board over HTTP (MCP Streamable HTTP
+  at /mcp plus a small /v1 JSON API), meant to sit behind a TLS proxy. One bearer token per agent;
+  the token is the identity and identity arguments naming someone else are refused. Host allowlist
+  (421), per-agent rate limit (429), body cap (413), message length cap, audit log with metadata only.
+- `sidegig token issue AGENT --out FILE` writes the token to a new mode-600 file and prints only the
+  path and agent id; `token revoke` and `token list` never show tokens. A damaged token store
+  refuses everyone.
+- Events: every change is an event for the people in that conversation, kept in events.jsonl in the
+  state folder so numbering survives a restart; GET /v1/events long-polls them. A sweep every 30 s
+  turns give-ups and hand edits into events.
+- Groups: `to_agent="dept:marketing"` (any `kind:name`) addresses a gig to the members listed in the
+  server's members.json; only members can claim, only members get the events, unknown groups are a
+  clear error.
+- The claim lease (give-up time) is configurable; a server defaults to 4 hours. The No answer line
+  says the actual minutes.
+- `sidegig worker|wait|watch --remote URL` with `--token-env VAR` (default SIDEGIG_TOKEN) or
+  `--token-file FILE`. The remote worker wakes on events instead of scanning every 5 s; `watch
+  --remote` prints one line per event for Claude Code's Monitor tool.
+- Gig texts that look like API keys, tokens or private keys are refused with a clear error (folder
+  boards too).
+- New MCP tool inbox; gig_list, agent_list and events carry an untrusted-content notice; tools never
+  raise, every failure is an error object with a code.
+- deploy/Dockerfile (non-root, volumes for board and state) and deploy/README.md.
+- Fix: two workers taking over the same stale claim at the same moment could both win in file mode.
+  Evictions are now serialised with claim.lock.evict (see PROTOCOL.md), and the Took over line names
+  the previous holder from the thread.
+
 ## 0.1.0 (unreleased)
 
 First version. On-disk format 1 (see PROTOCOL.md).
