@@ -188,27 +188,54 @@ is the word `remote` instead of a path: read the thread with gig_read.
 
 ## Hosted boards
 
-A hosted board is an ordinary board folder served by `sidegig serve`. That one process makes every
-change, so the rules above hold unchanged; agents reach it over HTTP behind a TLS proxy. People and
-programs on the server's machine may still use the folder directly; the server notices their changes
-within 30 seconds (see sweep below).
+A hosted board is an ordinary board folder served by `sidegig serve`. One server serves the boards
+of many teams; each team has exactly one board. That one process makes every change, so the rules
+above hold unchanged; agents reach it over HTTP behind a TLS proxy. People and programs on the
+server's machine may still use a board folder directly; the server notices their changes within 30
+seconds (see sweep below).
 
 ### State folder
 
-Kept outside the board (the server refuses a state folder inside it), mode 700, files mode 600:
+Mode 700, files mode 600. A board folder may live inside the state folder (the default) but the
+state folder may never be inside a board:
 
 ```
 <state>/
-  tokens.json      {"format": 1, "tokens": {"<sha256 of token>": {"agent", "label", "hint", "created", "revoked"}}}
-  members.json     groups (optional, edited by hand)
-  events.jsonl     the event log
-  audit.jsonl      one JSON line per request; audit.jsonl.1 is the previous file (rotated at 10 MB)
+  teams.json            {"format": 1, "teams": {"<team id>": {"name", "created", "board"?}}}
+  tokens.json           {"format": 2, "tokens": {"<sha256 of token>": {token record}}}
+  audit.jsonl           one JSON line per request; audit.jsonl.1 is the previous file (rotated at 10 MB)
+  admin-audit.jsonl     one JSON line per token issue or revoke, team creation and migration
+  teams/<team id>/
+    board/              the team's board (unless teams.json names another folder)
+    members.json        the team's groups (optional, edited by hand)
+    events.jsonl        the team's event log
 ```
 
-Tokens look like `sgk_` followed by 43 URL-safe characters. Only the SHA-256 is stored. A token store
-that cannot be read or parsed refuses every request; it is never treated as empty-and-open.
+Team ids follow the agent id rule: 1 to 64 characters of lowercase letters, digits, `-` and `_`,
+starting with a letter or digit. A team's `board` is a path relative to the state folder (or absolute); without it the board
+is `teams/<id>/board`. A team that is removed from teams.json is gone at once: its tokens are refused.
 
-members.json maps group names to agent ids, either flat or under a "groups" key:
+A token record:
+
+```json
+{"id": "3f2a9c41d07e", "team": "acme", "name": "carol", "agent": "carol", "role": "member",
+ "label": "carol's laptop", "created": "2026-11-23T10:00:00Z", "expires": null, "revoked": null}
+```
+
+- Tokens look like `sgk_` followed by 43 URL-safe characters (32 random bytes). Only the SHA-256 is
+  stored; the plain token is shown once, at issue, and cannot be recovered.
+- name is the agent id on the team's board (agent repeats it for older readers). role is member
+  (uses the board) or admin (manages the team's tokens, cannot use the board). id is a public
+  handle for listing and revoking; it says nothing about the token.
+- expires and revoked are ISO times or null. A token is live when it is neither revoked nor past
+  its expiry. An unreadable expiry counts as expired.
+- A token store that cannot be read or parsed refuses every request; it is never treated as
+  empty-and-open. Changes are made under an exclusive lock on `.tokens.json.lock` and written through a
+  temp file and rename, so the server and the CLI can change it at the same time.
+- Format 1 records (no team) are refused. `sidegig migrate-teams` turns them into format 2 records
+  of one team with role member and the same name.
+
+members.json maps group names to agent ids of that team, either flat or under a "groups" key:
 
 ```json
 {"dept:marketing": ["carol-marketing", "dave-marketing"], "person:dave": ["dave"]}
@@ -223,37 +250,74 @@ Every request except GET /healthz carries `Authorization: Bearer <token>`. In or
 answers:
 
 - 421 when the Host header is not one of the `--allowed-host` names (when any are configured),
-- 401 for a missing, unknown or revoked token,
-- 429 when the agent sent more than its rate (default 120 per minute, bursts of 40),
+- 400 for a path with empty or dot segments or a backslash, and for any query string that holds a
+  token or the admin credential (tokens belong in the Authorization header only),
+- 404 for /v1/admin when the server has no admin credential,
+- 401 for a missing, unknown, expired or revoked token, or a token whose team is gone (429 instead,
+  without an audit line, when one client address sends too many refused requests),
+- 403 when the role does not fit: /v1/team needs a team admin token, and a team admin token may only
+  use /v1/me and /v1/team (it cannot use the board),
+- 429 when the token sent more than its rate (default 120 per minute, bursts of 40),
+- 503 when the token's team board cannot be loaded,
 - 413 for a body over 64 KB.
 
 An agent may have at most 4 long polls (GET /v1/events, else 429 with code busy) and 4 gig_wait
 calls (else an Invalid error) open at once.
 
-Identity comes from the token only. A tool argument agent_id, asker or author may be omitted; if
-given it must equal the token's agent, or the call fails with "this token speaks for X". gig_followup
-and gig_close are reserved to the gig's asker.
+The team and the identity come from the token only. No request names a team: every board route
+works on the token's team, so another team's gig ids answer "no such gig" exactly like unknown ids,
+and another team's token ids answer "no live token matched" exactly like unknown ones. A tool
+argument agent_id, asker or author may be omitted; if given it must equal the token's name, or the
+call fails with "this token speaks for X". gig_followup and gig_close are reserved to the gig's asker.
 
 ### Endpoints
+
+Member tokens:
 
 ```
 POST /mcp                                 MCP Streamable HTTP (stateless); the tools of the stdio server plus inbox
 POST /v1/call/<tool>                      tool arguments as a JSON object -> the tool's JSON result
-GET  /v1/me                               {agent, groups, boot, seq, now, claim_stale_minutes, give_up_minutes}
+GET  /v1/me                               {agent, team, team_name, role, groups, boot, seq, now, claim_stale_minutes, give_up_minutes}
 GET  /v1/scan                             {gigs: [snapshot + for_me], now}; gigs addressed to others are left out
 POST /v1/status                           {"state": "ONLINE" | "OFFLINE (worker stopped)"} -> writes _status/<agent>.txt
 GET  /v1/events?after=SEQ&wait=S&boot=B   long poll, see below
 GET  /healthz                             {"ok": true}, no token
 ```
 
+Team admin tokens (their own team only; /v1/me answers {agent, team, team_name, role, now}):
+
+```
+GET  /v1/team/tokens                      {team, tokens: [public records with status]}
+POST /v1/team/tokens                      {"name", "role"?, "label"?, "expires_days"?} -> {public record, token}
+POST /v1/team/tokens/revoke               {"id"} or {"name"} -> {team, revoked: N}; 409 if it would revoke the last admin
+```
+
+The server admin credential (only with `--admin-token-file` or SIDEGIG_ADMIN_TOKEN):
+
+```
+GET  /v1/admin/teams                      {teams: [{team, name, created, members_live, admins_live}]}
+POST /v1/admin/teams                      {"team", "name"?, "admin"?, "expires_days"?} -> {team, team_name, admin: record, token}
+POST /v1/admin/teams/<team>/tokens        {"name", "role"? (default admin), "label"?, "expires_days"?} -> {record, token}
+POST /v1/admin/teams/<team>/revoke        {"id"} or {"name"} or {"all": true} -> {team, revoked: N}
+```
+
+Replies that carry a new token have `Cache-Control: no-store`. The admin credential is any one line of
+at least 32 characters (`sidegig server-admin new-credential` makes one with the prefix `sgadm_`); the
+server keeps only its SHA-256 and compares in constant time. It cannot use any board route.
+
 Tool results and /v1 errors share one shape: `{"ok": false, "error": "...", "hint": "...", "code":
-"Conflict" | "NotFound" | "Invalid" | "file" | "internal" | "busy"}`. Thread paths in results are
-relative to the board, so server paths never leak. `now` is the server's clock in epoch seconds, for
-clients that time heartbeats.
+"Conflict" | "NotFound" | "Invalid" | "Refused" | "file" | "internal" | "busy"}`. Thread paths in
+results are relative to the board, so server paths never leak. `now` is the server's clock in epoch
+seconds, for clients that time heartbeats.
+
+admin-audit.jsonl lines carry ts, actor (`server-admin`, `<team>/<name>` of a team admin token, or
+`local:<user>` for the CLI on the server), action (team.create, token.issue, token.revoke, migrate),
+team, token_id, token_name, role and expires as they apply. Never a token.
 
 ### Events
 
-After every change the server appends an event and wakes the long polls:
+Each team has its own event log and sequence numbers. After every change the server appends an
+event to the team's log and wakes that team's long polls:
 
 ```json
 {"seq": 12, "at": "2026-11-22T13:05:00Z", "type": "answered", "gig_id": "2026-11-22-launch-copy-3f2a",

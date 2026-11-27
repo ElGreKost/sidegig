@@ -1,7 +1,8 @@
 """Command line: init, register, agents, post, list, read, claim, heartbeat, answer, say, followup,
-close, wait, watch, mcp, worker, serve, token. Most commands take --root (or the SIDEGIG_ROOT
-environment variable). worker, wait and watch also run against a hosted board with
---remote URL (token from --token-env VAR, default SIDEGIG_TOKEN, or --token-file FILE).
+close, wait, watch, mcp, worker; and for hosted servers serve, migrate-teams, team, token,
+team-admin, server-admin. Most commands take --root (or the SIDEGIG_ROOT environment variable).
+worker, wait and watch also run against a hosted board with --remote URL (token from --token-env
+VAR, default SIDEGIG_TOKEN, or --token-file FILE). No command ever prints a token.
 
 Exit codes: 0 success, 1 error, 2 `wait` timed out, 3 `wait` found the gig closed without an answer."""
 import argparse
@@ -9,7 +10,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from . import fsio
 from . import protocol as P
@@ -259,52 +260,68 @@ _LOOPBACK = ("127.0.0.1", "localhost", "::1")
 
 
 def cmd_serve(a: argparse.Namespace) -> int:
-    """Serve one board over HTTP (MCP at /mcp) for agents on other machines. Put a TLS proxy in front."""
+    """Serve every team's board over HTTP (MCP at /mcp) for agents on other machines. Put a TLS proxy in front."""
     from .remote import serve
-    board = Path(a.board)
-    if a.init and not (board / "board.json").is_file():
-        board.mkdir(parents=True, exist_ok=True)
-        Board(board).init(a.init)
-    Board(board)._ensure()
+    from .tokens import load_admin_hash
     if a.give_up_minutes < 1 or a.claim_stale_minutes < 1:
         raise Invalid("--give-up-minutes and --claim-stale-minutes must be at least 1")
     if a.host not in _LOOPBACK and not a.allowed_host:
         print(f"sidegig serve: warning: listening on {a.host} without --allowed-host; only expose it through "
               "a TLS proxy (and pass --allowed-host with the public host name)", file=sys.stderr, flush=True)
+    admin_hash = load_admin_hash(a.admin_token_file)
     try:
-        serve(board, _state_dir(a), host=a.host, port=a.port, forwarded_allow_ips=a.forwarded_allow_ips,
+        serve(_state_dir(a), board=a.board, host=a.host, port=a.port, forwarded_allow_ips=a.forwarded_allow_ips,
               allowed_hosts=a.allowed_host or None, give_up_s=a.give_up_minutes * 60.0,
               claim_stale_s=a.claim_stale_minutes * 60.0, rate_per_min=a.rate_per_min, max_text=a.max_text,
-              audit=not a.no_audit)
+              audit=not a.no_audit, admin_hash=admin_hash)
     except ValueError as exc:
-        raise Invalid(str(exc), "use a state folder outside the board folder") from None
+        raise Invalid(str(exc)) from None
     return 0
 
 
-def _token_store(a: argparse.Namespace):
-    from .tokens import TokenStore
+def _private_state(a: argparse.Namespace) -> Path:
     state = _state_dir(a)
     state.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(state, 0o700)
     except OSError:
         pass
-    return TokenStore(state / "tokens.json")
+    return state
 
 
-def cmd_token_issue(a: argparse.Namespace) -> int:
-    """Issue a token and write it to --out (mode 600). Only the path and agent id are printed."""
-    if not P.valid_agent_id(a.agent or ""):
-        raise Invalid(f"bad agent id: {a.agent!r}", "use lowercase letters, digits, - and _")
-    out = Path(a.out).expanduser()
+def _token_store(a: argparse.Namespace):
+    from .tokens import TokenStore
+    return TokenStore(_private_state(a) / "tokens.json")
+
+
+def _team_of(a: argparse.Namespace) -> str:
+    """--team, or the only team there is."""
+    from .teams import TeamStore
+    team = getattr(a, "team", None)
+    ids = [t["team"] for t in TeamStore(_private_state(a)).list()]
+    if team:
+        if team not in ids:
+            raise NotFound(f"no team {team!r} in this state folder", "list them with: sidegig team list --state DIR")
+        return team
+    if len(ids) == 1:
+        return ids[0]
+    raise Invalid("say which team: pass --team ID" if ids else "this state folder has no team yet",
+                  ("teams: " + ", ".join(ids)) if ids else
+                  "create one with: sidegig team create ID --state DIR --admin NAME --out FILE "
+                  "(or sidegig migrate-teams for a server from before teams)")
+
+
+def _write_token_file(out_arg: str, produce) -> Dict[str, Any]:
+    """Create --out (mode 600, must not exist), call produce() -> (token, info), write the token and
+    return info. The token is never printed; on any failure the file is removed again."""
+    out = Path(out_arg).expanduser()
     if out.exists() or out.is_symlink():
         raise Invalid(f"{out} already exists", "pick a new path, or delete the old file first")
     if not out.parent.is_dir():
         raise Invalid(f"the folder {out.parent} does not exist", "create it first, or pick another --out path")
-    store = _token_store(a)
     fd = os.open(str(out), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        token = store.issue(a.agent, label=a.label or "")
+        token, info = produce()
         os.write(fd, (token + "\n").encode("ascii"))
         del token
     except BaseException:
@@ -313,24 +330,227 @@ def cmd_token_issue(a: argparse.Namespace) -> int:
         raise
     os.close(fd)
     os.chmod(out, 0o600)
-    _emit(a, {"agent": a.agent, "token_file": str(out)}, f"issued a token for {a.agent}; written to {out} (mode 600)")
-    print("give that file to the agent's owner over a private channel; the agent uses it with "
-          "--token-file FILE, or SIDEGIG_TOKEN=$(cat FILE) for the MCP config. The token is not shown "
-          "anywhere else and cannot be shown again.", file=sys.stderr)
+    return {**info, "token_file": str(out)}
+
+
+_HANDOVER = ("give that file to its owner over a private channel; an agent uses it with --token-file FILE, or "
+             "SIDEGIG_TOKEN=$(cat FILE) for the MCP config. The token is not shown anywhere else and cannot be "
+             "shown again.")
+
+
+def _issued(a: argparse.Namespace, info: Dict[str, Any]) -> None:
+    what = f"a {info.get('role', 'member')} token for {info.get('name')} in team {info.get('team')}"
+    _emit(a, info, f"issued {what} (id {info.get('id')}"
+                   + (f", expires {info['expires']}" if info.get("expires") else "") + f"); written to "
+                   f"{info['token_file']} (mode 600)")
+    print(_HANDOVER, file=sys.stderr)
+
+
+def cmd_token_issue(a: argparse.Namespace) -> int:
+    """Issue a token and write it to --out (mode 600). Only the path, team, name and id are printed."""
+    from .teams import admin_audit, local_actor
+    if not P.valid_agent_id(a.name or ""):
+        raise Invalid(f"bad name: {a.name!r}", "use lowercase letters, digits, - and _ (it is the agent id)")
+    team = _team_of(a)
+    store = _token_store(a)
+    info = _write_token_file(a.out, lambda: store.issue(team, a.name, role=a.role, label=a.label or "",
+                                                         expires_days=a.expires_days))
+    admin_audit(store.path.parent, {"actor": local_actor(), "action": "token.issue", "team": team,
+                                    "token_id": info["id"], "token_name": info["name"], "role": info["role"],
+                                    "expires": info["expires"]})
+    _issued(a, info)
     return 0
 
 
 def cmd_token_revoke(a: argparse.Namespace) -> int:
-    n = _token_store(a).revoke(agent_id=a.agent)
-    _emit(a, {"agent": a.agent, "revoked": n}, f"revoked {n} token(s) of {a.agent}; the server refuses them from the next request")
+    from .teams import admin_audit, local_actor
+    if not (a.name or a.id or a.all):
+        raise Invalid("say which token to revoke", "pass a NAME, --id ID (from token list) or --all")
+    team = _team_of(a)
+    store = _token_store(a)
+    n = store.revoke(team, token_id=a.id, name=a.name, everything=a.all)
+    admin_audit(store.path.parent, {"actor": local_actor(), "action": "token.revoke", "team": team,
+                                    "token_id": a.id, "token_name": a.name, "all": a.all, "revoked": n})
+    _emit(a, {"team": team, "revoked": n}, f"revoked {n} token(s) in team {team}; the server refuses them from the "
+                                           "next request")
     return 0
 
 
+def _token_table(rows: List[Dict[str, Any]]) -> str:
+    return "\n".join(f"{r['id']:<13} {r['team']:<16} {r['name']:<24} {r['role']:<7} {r['created']}  {r['status']}"
+                     + (f"  (expires {r['expires']})" if r.get("expires") and r["status"] == "live" else "")
+                     for r in rows) or "(no tokens)"
+
+
 def cmd_token_list(a: argparse.Namespace) -> int:
-    rows = [{"agent": r.get("agent"), "created": r.get("created"),
-             "status": f"revoked {r['revoked']}" if r.get("revoked") else "live"} for r in _token_store(a).list()]
-    human = "\n".join(f"{r['agent']:<24} {r['created']}  {r['status']}" for r in rows) or "(no tokens)"
+    team = _team_of(a) if a.team or not a.all_teams else None
+    rows = _token_store(a).records(team)
+    _emit(a, rows, _token_table(rows))
+    return 0
+
+
+def cmd_team_create(a: argparse.Namespace) -> int:
+    from .teams import create_team
+    state = _private_state(a)
+    info = _write_token_file(a.out, lambda: create_team(state, a.team, a.name or a.team, a.admin, board=a.board,
+                                                        expires_days=a.expires_days))
+    tok = info.pop("token")
+    info = {**info, **{k: tok[k] for k in ("id", "role", "expires")}, "admin": tok["name"]}
+    _emit(a, info, f"created team {info['team']} ({info['name']}) and its first admin token for {info['admin']}; "
+                   f"written to {info['token_file']} (mode 600)")
+    print("that file is the team admin's: with it they issue and revoke their team's tokens "
+          "(sidegig team-admin issue NAME --remote URL --token-file FILE --out NEW_FILE). It cannot use the board. "
+          "The token is not shown anywhere else.", file=sys.stderr)
+    return 0
+
+
+def cmd_team_list(a: argparse.Namespace) -> int:
+    from .teams import TeamStore
+    state = _private_state(a)
+    recs = _token_store(a).records()
+    rows = []
+    for t in TeamStore(state).list():
+        live = [r for r in recs if r["team"] == t["team"] and r["status"] == "live"]
+        rows.append({"team": t["team"], "name": t.get("name"), "created": t.get("created"),
+                     "board": str(TeamStore(state).board_path(t["team"], t)),
+                     "members_live": sum(1 for r in live if r["role"] == "member"),
+                     "admins_live": sum(1 for r in live if r["role"] == "admin")})
+    human = "\n".join(f"{r['team']:<16} {r['name']:<28} members {r['members_live']:<4} admins {r['admins_live']:<3} "
+                      f"{r['board']}" for r in rows) or "(no teams)"
     _emit(a, rows, human)
+    return 0
+
+
+def cmd_migrate_teams(a: argparse.Namespace) -> int:
+    from .teams import migrate
+    steps = migrate(_state_dir(a), a.board, team=a.team, name=a.name, dry_run=a.dry_run)
+    human = "\n".join(f"{s['result']:<13} {s['step']:<13} {s['detail']}" for s in steps)
+    if a.dry_run:
+        human += "\n(dry run: nothing was changed; run again without --dry-run, with the server stopped)"
+    _emit(a, steps, human)
+    return 0
+
+
+# ------------------------------------------------------------------ token management over the network
+def _admin_client(a: argparse.Namespace, default_env: str):
+    from .client import AdminClient, read_token
+    warn = lambda line: print(line, file=sys.stderr, flush=True)  # noqa: E731
+    token = read_token(getattr(a, "token_env", None) or default_env, getattr(a, "token_file", None), warn=warn)
+    return AdminClient(a.remote, token)
+
+
+def _check_team_arg(team: str) -> str:
+    from .tokens import valid_team_id
+    if not valid_team_id(team or ""):
+        raise Invalid(f"bad team id: {team!r}", "lowercase letters, digits, - and _")
+    return team
+
+
+def _from_server(reply: Dict[str, Any]):
+    token = str(reply.get("token") or "")
+    if not token:
+        raise Invalid("the server sent no token")
+    info = {k: v for k, v in reply.items() if k not in ("token", "ok")}
+    return token, info
+
+
+def cmd_team_admin_issue(a: argparse.Namespace) -> int:
+    if not P.valid_agent_id(a.name or ""):
+        raise Invalid(f"bad name: {a.name!r}", "use lowercase letters, digits, - and _ (it is the agent id)")
+    ac = _admin_client(a, "SIDEGIG_TOKEN")
+    try:
+        info = _write_token_file(a.out, lambda: _from_server(ac.team_issue(a.name, a.role, a.label or "",
+                                                                            a.expires_days)))
+    finally:
+        ac.close()
+    _issued(a, info)
+    return 0
+
+
+def cmd_team_admin_list(a: argparse.Namespace) -> int:
+    ac = _admin_client(a, "SIDEGIG_TOKEN")
+    try:
+        rows = ac.team_tokens()
+    finally:
+        ac.close()
+    _emit(a, rows, _token_table(rows))
+    return 0
+
+
+def cmd_team_admin_revoke(a: argparse.Namespace) -> int:
+    if not (a.name or a.id):
+        raise Invalid("say which token to revoke", "pass a NAME or --id ID (from team-admin list)")
+    ac = _admin_client(a, "SIDEGIG_TOKEN")
+    try:
+        n = ac.team_revoke(token_id=a.id, name=a.name)
+    finally:
+        ac.close()
+    _emit(a, {"revoked": n}, f"revoked {n} token(s); the server refuses them from the next request")
+    return 0
+
+
+def cmd_server_admin_credential(a: argparse.Namespace) -> int:
+    from .tokens import ADMIN_PREFIX, new_token
+    info = _write_token_file(a.out, lambda: (new_token(ADMIN_PREFIX), {}))
+    _emit(a, info, f"wrote a new server admin credential to {info['token_file']} (mode 600)")
+    print("give it to the server with --admin-token-file FILE (a root-only file, never in git), or in the "
+          "SIDEGIG_ADMIN_TOKEN environment variable. It is not shown anywhere else.", file=sys.stderr)
+    return 0
+
+
+def cmd_server_admin_teams(a: argparse.Namespace) -> int:
+    ac = _admin_client(a, "SIDEGIG_ADMIN_TOKEN")
+    try:
+        rows = ac.teams()
+    finally:
+        ac.close()
+    human = "\n".join(f"{r['team']:<16} {str(r.get('name')):<28} members {r['members_live']:<4} "
+                      f"admins {r['admins_live']}" for r in rows) or "(no teams)"
+    _emit(a, rows, human)
+    return 0
+
+
+def cmd_server_admin_create(a: argparse.Namespace) -> int:
+    team = _check_team_arg(a.team)
+    if not P.valid_agent_id(a.admin or ""):
+        raise Invalid(f"bad admin name: {a.admin!r}", "lowercase letters, digits, - and _")
+    ac = _admin_client(a, "SIDEGIG_ADMIN_TOKEN")
+    try:
+        info = _write_token_file(a.out, lambda: _from_server(ac.create_team(team, a.name or team, a.admin,
+                                                                             a.expires_days)))
+    finally:
+        ac.close()
+    _emit(a, info, f"created team {info.get('team')} ({info.get('team_name')}) and its first admin token for "
+                   f"{a.admin}; written to {info['token_file']} (mode 600)")
+    print("that file is the team admin's: with it they issue and revoke their team's tokens (sidegig team-admin). "
+          "Hand it over a private channel; it is not shown anywhere else.", file=sys.stderr)
+    return 0
+
+
+def cmd_server_admin_issue(a: argparse.Namespace) -> int:
+    team = _check_team_arg(a.team)
+    if not P.valid_agent_id(a.name or ""):
+        raise Invalid(f"bad name: {a.name!r}", "lowercase letters, digits, - and _")
+    ac = _admin_client(a, "SIDEGIG_ADMIN_TOKEN")
+    try:
+        info = _write_token_file(a.out, lambda: _from_server(ac.admin_issue(team, a.name, a.role, a.label or "",
+                                                                             a.expires_days)))
+    finally:
+        ac.close()
+    _issued(a, info)
+    return 0
+
+
+def cmd_server_admin_revoke(a: argparse.Namespace) -> int:
+    team = _check_team_arg(a.team)
+    if not (a.name or a.id or a.all):
+        raise Invalid("say which token to revoke", "pass --name NAME, --id ID or --all")
+    ac = _admin_client(a, "SIDEGIG_ADMIN_TOKEN")
+    try:
+        n = ac.admin_revoke(team, token_id=a.id, name=a.name, everything=a.all)
+    finally:
+        ac.close()
+    _emit(a, {"team": team, "revoked": n}, f"revoked {n} token(s) in team {team}")
     return 0
 
 
@@ -450,10 +670,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds a gig text must stay unchanged (default 10; 0 with --remote)")
     s.add_argument("--max-active", type=int, default=3, help="most gigs held at once")
 
-    s = add("serve", cmd_serve, "serve a board over HTTP for agents on other machines (put TLS in front)",
+    s = add("serve", cmd_serve, "serve every team's board over HTTP for agents on other machines (put TLS in front)",
             parents=(state,))
-    s.add_argument("--board", required=True, metavar="DIR", help="the board folder")
-    s.add_argument("--init", metavar="NAME", help="create the board with this name if the folder has none")
+    s.add_argument("--board", metavar="DIR",
+                   help="optional: a team's board folder, for servers started the single-board way; it must be "
+                        "registered (sidegig migrate-teams), else the server refuses to start")
+    s.add_argument("--init", metavar="NAME", help=argparse.SUPPRESS)       # accepted from older setups, ignored
     s.add_argument("--host", default="127.0.0.1", help="address to bind (default 127.0.0.1)")
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--allowed-host", action="append", metavar="HOST",
@@ -463,22 +685,110 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--give-up-minutes", type=float, default=240.0, help="claim lease: give up a claim this old (default 240)")
     s.add_argument("--claim-stale-minutes", type=float, default=10.0,
                    help="a claim without a heartbeat this long can be taken over (default 10)")
-    s.add_argument("--rate-per-min", type=float, default=120.0, help="requests per minute per agent (default 120)")
+    s.add_argument("--rate-per-min", type=float, default=120.0, help="requests per minute per token (default 120)")
     s.add_argument("--max-text", type=int, default=20000, help="longest message text in characters (default 20000)")
     s.add_argument("--no-audit", action="store_true", help="do not write audit.jsonl")
+    s.add_argument("--admin-token-file", metavar="FILE",
+                   help="turns on the server admin API (/v1/admin): a file only its owner can read, holding the "
+                        "credential (sidegig server-admin new-credential); or set SIDEGIG_ADMIN_TOKEN")
 
-    tok = sub.add_parser("token", help="issue, revoke and list agent tokens of a hosted board",
-                         description="Tokens live (hashed) in STATE/tokens.json; the server picks up changes at once.")
+    s = add("migrate-teams", cmd_migrate_teams, "move a single-board server's tokens, groups and events into one "
+            "team (idempotent; stop the server first)", parents=(state,))
+    s.add_argument("--board", required=True, metavar="DIR", help="the board folder the server served (--board)")
+    s.add_argument("--team", default="default", help="the team id (default: default)")
+    s.add_argument("--name", help="the team's display name (default: the board's name)")
+    s.add_argument("--dry-run", action="store_true", help="show the steps, change nothing")
+
+    team = sub.add_parser("team", help="create and list the teams of a hosted server (on the server's machine)",
+                          description="Teams live in STATE/teams.json; each owns one board and its tokens.")
+    tmsub = team.add_subparsers(dest="team_cmd", required=True, metavar="ACTION")
+    s = add("create", cmd_team_create, "create a team with its board and its first admin token (written to --out)",
+            parents=(state,), where=tmsub)
+    s.add_argument("team", metavar="TEAM_ID", help="lowercase letters, digits, - and _")
+    s.add_argument("--name", help="display name (default: the id)")
+    s.add_argument("--admin", required=True, metavar="NAME", help="name of the first team admin token")
+    s.add_argument("--out", required=True, metavar="FILE", help="new file to write the admin token to (must not exist)")
+    s.add_argument("--board", metavar="DIR", help="board folder (default STATE/teams/TEAM_ID/board)")
+    s.add_argument("--expires-days", type=float, metavar="DAYS", help="the admin token expires after this many days")
+    add("list", cmd_team_list, "list teams with their live token counts", parents=(state,), where=tmsub)
+
+    tok = sub.add_parser("token", help="issue, revoke and list tokens (on the server's machine)",
+                         description="Tokens live (hashed) in STATE/tokens.json; the server picks up changes at once. "
+                                     "--team may be left out when the server has one team.")
     tsub = tok.add_subparsers(dest="token_cmd", required=True, metavar="ACTION")
     s = add("issue", cmd_token_issue, "issue a token; writes it to --out with mode 600 and never prints it",
             parents=(state,), where=tsub)
-    s.add_argument("agent", metavar="AGENT_ID")
+    s.add_argument("name", metavar="NAME", help="the agent id (or, for --role admin, the admin's name)")
     s.add_argument("--out", required=True, metavar="FILE", help="new file to write the token to (must not exist)")
+    s.add_argument("--team", help="team id")
+    s.add_argument("--role", choices=("member", "admin"), default="member",
+                   help="member uses the board; admin manages the team's tokens (default member)")
+    s.add_argument("--expires-days", type=float, metavar="DAYS", help="the token expires after this many days")
     s.add_argument("--label", default="", help="a note for the operator, e.g. whose laptop")
-    s = add("revoke", cmd_token_revoke, "revoke every live token of an agent", parents=(state,), where=tsub)
-    s.add_argument("agent", metavar="AGENT_ID")
-    add("list", cmd_token_list, "list tokens: agent id, created, live or revoked (never the tokens)",
-        parents=(state,), where=tsub)
+    s = add("revoke", cmd_token_revoke, "revoke tokens of a team: every live token of NAME, one --id, or --all",
+            parents=(state,), where=tsub)
+    s.add_argument("name", metavar="NAME", nargs="?")
+    s.add_argument("--id", help="the token id shown by token list")
+    s.add_argument("--all", action="store_true", help="every live token of the team")
+    s.add_argument("--team", help="team id")
+    s = add("list", cmd_token_list, "list tokens: id, team, name, role, created, status (never the tokens)",
+            parents=(state,), where=tsub)
+    s.add_argument("--team", help="team id")
+    s.add_argument("--all-teams", action="store_true", help="every team's tokens")
+
+    remote_admin = argparse.ArgumentParser(add_help=False)
+    remote_admin.add_argument("--remote", required=True, metavar="URL", help="the server (https://HOST)")
+    remote_admin.add_argument("--token-env", metavar="VAR", help="environment variable holding the token")
+    remote_admin.add_argument("--token-file", metavar="FILE", help="file holding the token")
+    remote_admin.add_argument("--json", action="store_true", help="print JSON instead of text")
+
+    ta = sub.add_parser("team-admin", help="manage your team's tokens over the network (team admin token)",
+                        description="Needs a team admin token (--token-file, or --token-env VAR, default "
+                                    "SIDEGIG_TOKEN). It reaches your own team only.")
+    tasub = ta.add_subparsers(dest="team_admin_cmd", required=True, metavar="ACTION")
+    s = add("issue", cmd_team_admin_issue, "issue a token for your team; written to --out (mode 600), never printed",
+            parents=(remote_admin,), where=tasub)
+    s.add_argument("name", metavar="NAME")
+    s.add_argument("--out", required=True, metavar="FILE")
+    s.add_argument("--role", choices=("member", "admin"), default="member")
+    s.add_argument("--expires-days", type=float, metavar="DAYS")
+    s.add_argument("--label", default="")
+    add("list", cmd_team_admin_list, "list your team's tokens (never the tokens)", parents=(remote_admin,), where=tasub)
+    s = add("revoke", cmd_team_admin_revoke, "revoke every live token of NAME, or one --id", parents=(remote_admin,),
+            where=tasub)
+    s.add_argument("name", metavar="NAME", nargs="?")
+    s.add_argument("--id", help="the token id shown by team-admin list")
+
+    sa = sub.add_parser("server-admin", help="create teams over the network (server admin credential)",
+                        description="Needs the server admin credential (--token-file, or --token-env VAR, default "
+                                    "SIDEGIG_ADMIN_TOKEN); the server must run with --admin-token-file.")
+    sasub = sa.add_subparsers(dest="server_admin_cmd", required=True, metavar="ACTION")
+    s = add("new-credential", cmd_server_admin_credential, "write a new random server admin credential to --out",
+            parents=(), where=sasub)
+    s.add_argument("--out", required=True, metavar="FILE")
+    s.add_argument("--json", action="store_true")
+    add("teams", cmd_server_admin_teams, "list the teams", parents=(remote_admin,), where=sasub)
+    s = add("create-team", cmd_server_admin_create, "create a team and its first admin token (written to --out)",
+            parents=(remote_admin,), where=sasub)
+    s.add_argument("team", metavar="TEAM_ID")
+    s.add_argument("--name", help="display name")
+    s.add_argument("--admin", default="admin", metavar="NAME", help="name of the first admin token (default admin)")
+    s.add_argument("--out", required=True, metavar="FILE")
+    s.add_argument("--expires-days", type=float, metavar="DAYS")
+    s = add("issue", cmd_server_admin_issue, "issue a token for a team, for example a new admin token",
+            parents=(remote_admin,), where=sasub)
+    s.add_argument("team", metavar="TEAM_ID")
+    s.add_argument("name", metavar="NAME")
+    s.add_argument("--out", required=True, metavar="FILE")
+    s.add_argument("--role", choices=("member", "admin"), default="admin")
+    s.add_argument("--expires-days", type=float, metavar="DAYS")
+    s.add_argument("--label", default="")
+    s = add("revoke", cmd_server_admin_revoke, "revoke a team's tokens: --name, --id or --all",
+            parents=(remote_admin,), where=sasub)
+    s.add_argument("team", metavar="TEAM_ID")
+    s.add_argument("--name")
+    s.add_argument("--id")
+    s.add_argument("--all", action="store_true")
     return p
 
 

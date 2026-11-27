@@ -97,6 +97,8 @@ class RemoteBoard:
         self.warnings: List[str] = []
         self.offset = 0.0                      # server clock minus local clock
         self.agent_id: Optional[str] = None
+        self.team = ""
+        self.role = ""
         self.groups: List[str] = []
         self.limits: Dict[str, Any] = {}
         self.boot: Optional[str] = None
@@ -114,10 +116,18 @@ class RemoteBoard:
         except httpx.HTTPError as exc:
             raise RemoteUnavailable(f"cannot reach {self.base} ({exc.__class__.__name__})") from None
         if r.status_code == 401:
-            raise Refused("the board refused the token (missing, unknown or revoked)",
-                          "ask the board operator for a new one (sidegig token issue) and check --token-env / --token-file")
+            raise Refused("the board refused the token (missing, unknown, expired or revoked)",
+                          "ask your team admin for a new one (sidegig team-admin issue) and check --token-env / "
+                          "--token-file")
         if r.status_code == 421:
             raise Refused(f"the server does not answer to the host name in {self.base}", "check the --remote URL")
+        if r.status_code == 403:
+            try:
+                why = str(r.json().get("error") or "")
+            except ValueError:
+                why = ""
+            raise Refused(why or "this token may not do that",
+                          "board commands need a member token; token management needs a team admin token")
         if r.status_code == 429 or r.status_code >= 500:
             raise RemoteUnavailable(f"the board is busy or failing (HTTP {r.status_code}); retrying later")
         try:
@@ -142,6 +152,8 @@ class RemoteBoard:
         """GET /v1/me: learn our agent id, groups and the current event cursor."""
         me = self._request("GET", "/v1/me")
         self.agent_id = str(me.get("agent") or "")
+        self.team = str(me.get("team") or "")
+        self.role = str(me.get("role") or "member")
         self.groups = list(me.get("groups") or [])
         self.limits = {k: me.get(k) for k in ("claim_stale_minutes", "give_up_minutes")}
         if self.boot != me.get("boot"):
@@ -212,6 +224,60 @@ class RemoteBoard:
             self.events(min(seconds, 50.0))
         except RemoteUnavailable:
             time.sleep(min(seconds, 5.0))
+
+
+# ---------------------------------------------------------------------- token management
+class AdminClient:
+    """The token management API of a hosted server, for `sidegig team-admin` (a team admin token,
+    /v1/team: the caller's own team only) and `sidegig server-admin` (the server admin credential,
+    /v1/admin). Results that hold a new token go back to the caller, never to a log or the screen."""
+
+    def __init__(self, url: str, token: str, *, timeout: float = 30.0,
+                 transport: Optional[httpx.BaseTransport] = None):
+        self.rb = RemoteBoard(url, token, timeout=timeout, transport=transport)
+        self.base = self.rb.base
+
+    def close(self) -> None:
+        self.rb.close()
+
+    @staticmethod
+    def _grant(name: str, role: str, label: str, expires_days: Optional[float]) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"name": name, "role": role, "label": label}
+        if expires_days is not None:
+            body["expires_days"] = expires_days
+        return body
+
+    # team admin
+    def team_tokens(self) -> List[Dict[str, Any]]:
+        return list(self.rb._request("GET", "/v1/team/tokens").get("tokens") or [])
+
+    def team_issue(self, name: str, role: str = "member", label: str = "",
+                   expires_days: Optional[float] = None) -> Dict[str, Any]:
+        return self.rb._request("POST", "/v1/team/tokens", json=self._grant(name, role, label, expires_days))
+
+    def team_revoke(self, token_id: Optional[str] = None, name: Optional[str] = None) -> int:
+        return int(self.rb._request("POST", "/v1/team/tokens/revoke", json={"id": token_id, "name": name})["revoked"])
+
+    # server admin
+    def teams(self) -> List[Dict[str, Any]]:
+        return list(self.rb._request("GET", "/v1/admin/teams").get("teams") or [])
+
+    def create_team(self, team: str, name: str = "", admin: str = "admin",
+                    expires_days: Optional[float] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"team": team, "name": name or team, "admin": admin}
+        if expires_days is not None:
+            body["expires_days"] = expires_days
+        return self.rb._request("POST", "/v1/admin/teams", json=body)
+
+    def admin_issue(self, team: str, name: str, role: str = "admin", label: str = "",
+                    expires_days: Optional[float] = None) -> Dict[str, Any]:
+        return self.rb._request("POST", f"/v1/admin/teams/{team}/tokens",
+                                json=self._grant(name, role, label, expires_days))
+
+    def admin_revoke(self, team: str, token_id: Optional[str] = None, name: Optional[str] = None,
+                     everything: bool = False) -> int:
+        return int(self.rb._request("POST", f"/v1/admin/teams/{team}/revoke",
+                                    json={"id": token_id, "name": name, "all": everything})["revoked"])
 
 
 # ---------------------------------------------------------------------- wait

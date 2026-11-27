@@ -7,6 +7,7 @@ import pytest
 
 from sidegig import Board
 from sidegig.remote import build_remote_app
+from sidegig.teams import TeamStore
 from sidegig.tokens import TokenStore
 
 HDRS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
@@ -17,18 +18,19 @@ def setup(tmp_path):
     root = tmp_path / "board"
     Board(root).init("remote test")
     state = tmp_path / "state"
+    TeamStore(state).add("acme", "Acme", root, init=False)
     store = TokenStore(state / "tokens.json")
     toks = {}
     for aid in ("carol", "dave", "marketing", "dev", "w1", "w2", "w3", "w4", "w5", "w6"):
         Board(root).ensure_agent(aid, name=aid)
-        toks[aid] = store.issue(aid, label="test")
+        toks[aid] = store.issue("acme", aid, label="test")[0]
     return {"root": root, "state": state, "store": store, "tokens": toks, "audit": state / "audit.jsonl",
             "tmp": tmp_path}
 
 
 def run(setup, scenario, **kw):
     """Build the app, run its lifespan, hand scenario a call(token, tool, **args) helper."""
-    app = build_remote_app(setup["root"], setup["state"], poll_s=0.05, **kw)
+    app = build_remote_app(setup["state"], poll_s=0.05, **kw)
 
     async def main():
         async with app.lifespan():
@@ -63,7 +65,7 @@ def test_no_token_bad_token_and_revoked_token_are_refused(setup):
         assert (await raw(None, body)).status_code == 401
         assert (await raw("sgk_not-a-real-token", body)).status_code == 401
         assert (await raw(setup["tokens"]["dev"], body)).status_code == 200
-        setup["store"].revoke(agent_id="dev")                 # applies to the very next request
+        setup["store"].revoke("acme", name="dev")                 # applies to the very next request
         r = await raw(setup["tokens"]["dev"], body)
         assert r.status_code == 401 and "revoked" in r.json()["error"]
     run(setup, sc)
@@ -73,7 +75,7 @@ def test_token_decides_identity_and_impersonation_is_refused(setup):
     async def sc(call, raw, events, app):
         posted = await call("carol", "gig_post", title="Need launch copy", text="three lines", to_agent="marketing")
         gid = posted["gig_id"]
-        assert app.board.read(gid)["meta"]["asker"] == "carol"
+        assert app.team("acme").board.read(gid)["meta"]["asker"] == "carol"
         spoof = await call("carol", "gig_post", title="x", asker="dave")
         assert not spoof["ok"] and "speaks for carol" in spoof["error"]
         steal = await call("dev", "gig_claim", gig_id=gid, agent_id="marketing")
@@ -102,8 +104,8 @@ def test_concurrent_claims_over_http_have_exactly_one_winner(setup):
         results = await asyncio.gather(*[call(w, "gig_claim", gig_id=gid) for w in workers])
         winners = [w for w, r in zip(workers, results) if r["ok"]]
         assert len(winners) == 1
-        assert app.board.read(gid)["meta"]["claimed_by"] == winners[0]
-        thread = app.board.read(gid)["thread"]
+        assert app.team("acme").board.read(gid)["meta"]["claimed_by"] == winners[0]
+        thread = app.team("acme").board.read(gid)["thread"]
         assert thread.count("Picked up.") == 1
     run(setup, sc)
 
@@ -167,7 +169,7 @@ def test_a_standard_mcp_client_connects_with_its_token(setup):
     """The official MCP client (what Claude Code speaks): initialize, list tools, call one, over HTTP."""
     from mcp import ClientSession
     from mcp.client.streamable_http import streamable_http_client
-    app = build_remote_app(setup["root"], setup["state"])
+    app = build_remote_app(setup["state"])
 
     async def main():
         async with app.lifespan():
@@ -199,6 +201,6 @@ def test_stale_takeover_over_http_has_one_winner_every_time(setup):
             results = await asyncio.gather(*[call(w, "gig_claim", gig_id=gid) for w in workers])
             winners = [w for w, r in zip(workers, results) if r["ok"]]
             assert len(winners) == 1
-            thread = app.board.read(gid)["thread"]
+            thread = app.team("acme").board.read(gid)["thread"]
             assert thread.count("Took over from [w1]") == 1 and thread.count("Picked up.") == 2
     run(setup, sc, clock=clock)

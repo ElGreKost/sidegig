@@ -6,3 +6,13 @@ __pycache__/
 dist/
 build/
 uv.lock
+
+# Real deployment values stay out of git: copy deploy/example/ to infra/ and fill it in there.
+/infra/
+.env
+.env.*
+!.env.example
+*.token
+*.cred
+secrets/
+state/

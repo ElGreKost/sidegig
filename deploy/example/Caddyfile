@@ -1,0 +1,15 @@
+# Caddy gets and renews the certificate for SIDEGIG_HOST itself (ports 80 and 443 must reach it).
+# SIDEGIG_HOST and SIDEGIG_ALLOW come from .env through compose.yaml.
+#
+# There is no access log here (Caddy writes none without a log directive). If you add one, keep
+# Caddy's default of hiding the Authorization header.
+{$SIDEGIG_HOST} {
+	# Everyone outside the allowlist gets 403 before reaching sidegig.
+	@outside not remote_ip {$SIDEGIG_ALLOW}
+	respond @outside 403
+
+	reverse_proxy sidegig:8765 {
+		# long polls and gig_wait hold a request open for up to 60 s; pass events on unbuffered
+		flush_interval -1
+	}
+}

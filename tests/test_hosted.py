@@ -16,6 +16,7 @@ from sidegig.cli import main as cli_main
 from sidegig.client import RemoteBoard, RemoteUnavailable, check_url, event_line, wait_for_answer_remote, watch_remote
 from sidegig.errors import Conflict, Invalid, Refused
 from sidegig.remote import EventBus, build_remote_app
+from sidegig.teams import TeamStore
 from sidegig.tokens import TokenStore
 from sidegig.worker import Worker
 
@@ -26,9 +27,10 @@ AGENTS = ("carol", "dave", "dev", "carol-marketing", "dave-marketing")
 def hosted(tmp_path):
     root, state = tmp_path / "board", tmp_path / "state"
     Board(root).init("hosted test")
+    TeamStore(state).add("acme", "Acme", root, init=False)
     store = TokenStore(state / "tokens.json")
-    toks = {aid: store.issue(aid, label="test") for aid in AGENTS}
-    (state / "members.json").write_text(json.dumps({
+    toks = {aid: store.issue("acme", aid, label="test")[0] for aid in AGENTS}
+    (state / "teams" / "acme" / "members.json").write_text(json.dumps({
         "dept:marketing": ["carol-marketing", "dave-marketing"],
         "person:dave": ["dave", "dave-marketing"]}), "utf-8")
     return {"root": root, "state": state, "store": store, "tokens": toks, "tmp": tmp_path}
@@ -37,7 +39,7 @@ def hosted(tmp_path):
 def run(h, scenario, **kw):
     """Build the app, run its lifespan, give scenario call(who, tool, **args) and get(who, path, **params)."""
     kw.setdefault("sweep_s", 0)
-    app = build_remote_app(h["root"], h["state"], poll_s=0.05, **kw)
+    app = build_remote_app(h["state"], poll_s=0.05, **kw)
 
     async def main():
         async with app.lifespan():
@@ -102,9 +104,10 @@ def test_a_client_resumes_after_a_server_restart(hosted):
         stale_boot = await get("dev", "/v1/events", after=cursor, wait=0, boot="00000000")
         assert stale_boot["events"][0]["type"] == "posted"         # an unknown boot replays from the start
     run(hosted, second)
-    for name in ("events.jsonl", "audit.jsonl", "tokens.json"):    # only the server's user can read them
+    for name in ("teams/acme/events.jsonl", "audit.jsonl", "tokens.json", "teams.json"):   # only the server's user
         assert stat.S_IMODE(os.stat(hosted["state"] / name).st_mode) == 0o600
-    assert stat.S_IMODE(os.stat(hosted["state"]).st_mode) == 0o700
+    for name in ("", "teams/acme"):
+        assert stat.S_IMODE(os.stat(hosted["state"] / name).st_mode) == 0o700
 
 
 # ---------------------------------------------------------------------- HTTP API
@@ -181,7 +184,7 @@ def test_an_unreadable_token_store_refuses_everyone(hosted, damage):
     run(hosted, sc)
     if damage != "directory":
         with pytest.raises(Invalid, match="cannot use tokens.json"):
-            TokenStore(path).issue("dev")
+            TokenStore(path).issue("acme", "dev")
 
 
 def test_the_sweep_turns_a_give_up_into_an_event(hosted):
@@ -191,10 +194,10 @@ def test_the_sweep_turns_a_give_up_into_an_event(hosted):
     async def sc(call, get, client, app):
         gid = (await call("carol", "gig_post", title="Long job", to_agent="dev"))["gig_id"]
         await call("dev", "gig_claim", gig_id=gid)
-        app.board.sweep()                                          # takes stock
+        app.team("acme").board.sweep()                             # takes stock
         mark = (await get("carol", "/v1/events", after=0, wait=0))["next"]
         clock.advance(5 * 3600)
-        assert app.board.sweep() == 1
+        assert app.team("acme").board.sweep() == 1
         ev = (await get("carol", "/v1/events", after=mark, wait=0))["events"]
         assert [(e["type"], e["gig_id"]) for e in ev] == [("stale", gid)]
         assert [e["type"] for e in (await get("dev", "/v1/events", after=0, wait=0))["events"]][-1] == "stale"
@@ -216,7 +219,7 @@ def test_one_agent_cannot_open_unlimited_gig_waits(hosted):
 
 def test_state_folder_inside_the_board_is_refused(hosted):
     with pytest.raises(ValueError, match="inside the board"):
-        build_remote_app(hosted["root"], hosted["root"] / "_state")
+        build_remote_app(hosted["root"] / "_state", board=hosted["root"])
 
 
 # ---------------------------------------------------------------------- RemoteBoard + worker
@@ -224,7 +227,7 @@ def test_state_folder_inside_the_board_is_refused(hosted):
 def live(hosted):
     """The app on a real localhost port (uvicorn in a thread), for the synchronous client."""
     import uvicorn
-    app = build_remote_app(hosted["root"], hosted["state"], poll_s=0.05, sweep_s=0)
+    app = build_remote_app(hosted["state"], poll_s=0.05, sweep_s=0)
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -262,8 +265,9 @@ def test_remote_board_drives_the_worker_end_to_end(live):
     st = wait_for_answer_remote(asker, gid, timeout_s=5)
     assert st["state"] == "answered" and st["answer"]["text"].strip() == "Yes, ship it."
     w.step()
-    assert dev.agent_id == "dev" and [a["online"] for a in live["app"].board.agents() if a["id"] == "dev"] == [True]
-    live["store"].revoke(agent_id="dev")
+    assert dev.agent_id == "dev" and dev.team == "acme"
+    assert [a["online"] for a in live["app"].team("acme").board.agents() if a["id"] == "dev"] == [True]
+    live["store"].revoke("acme", name="dev")
     with pytest.raises(Refused):
         w.run()                                          # a revoked token stops the loop instead of spinning
     asker.close()
@@ -307,13 +311,18 @@ def test_client_refuses_plain_http_to_other_machines_and_bad_tokens(live, monkey
 def test_token_issue_writes_a_private_file_and_never_prints_the_token(tmp_path, capsys):
     state = tmp_path / "state"
     out = tmp_path / "dev.token"
+    assert cli_main(["token", "issue", "dev", "--state", str(state), "--out", str(out)]) == 1   # no team yet
+    assert "no team yet" in capsys.readouterr().err and not out.exists()
+    assert cli_main(["team", "create", "acme", "--state", str(state), "--admin", "boss",
+                     "--out", str(tmp_path / "boss.token")]) == 0
+    capsys.readouterr()
     assert cli_main(["token", "issue", "dev", "--state", str(state), "--out", str(out)]) == 0
     printed = capsys.readouterr()
     token = out.read_text().strip()
     assert token.startswith("sgk_") and token not in printed.out + printed.err
     assert str(out) in printed.out and "dev" in printed.out
     assert stat.S_IMODE(os.stat(out).st_mode) == 0o600
-    assert TokenStore(state / "tokens.json").verify(token) == "dev"
+    assert TokenStore(state / "tokens.json").verify(token).name == "dev"
     assert cli_main(["token", "issue", "dev", "--state", str(state), "--out", str(out)]) == 1   # no overwrite
     assert "already exists" in capsys.readouterr().err
     assert cli_main(["token", "list", "--state", str(state)]) == 0
@@ -323,7 +332,8 @@ def test_token_issue_writes_a_private_file_and_never_prints_the_token(tmp_path, 
     assert TokenStore(state / "tokens.json").verify(token) is None
     capsys.readouterr()
     assert cli_main(["token", "list", "--state", str(state), "--json"]) == 0
-    assert json.loads(capsys.readouterr().out)[0]["status"].startswith("revoked")
+    rows = {r["name"]: r for r in json.loads(capsys.readouterr().out)}
+    assert rows["dev"]["status"].startswith("revoked") and rows["boss"]["status"] == "live"
 
 
 def test_cli_wait_and_watch_against_a_live_server(live, monkeypatch, capsys, tmp_path):

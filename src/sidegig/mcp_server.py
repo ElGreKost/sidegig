@@ -112,13 +112,15 @@ def guarded(fn: Callable[..., Any]) -> Callable[..., str]:
 def build_app(root=None, agent_id: Optional[str] = None, *, poll_s: float = 3.0,
               clock: Optional[Callable[[], float]] = None, board: Optional[Board] = None,
               bound_identity: Optional[Callable[[], Optional[str]]] = None, max_text: int = 0,
-              **fastmcp_kwargs: Any) -> FastMCP:
+              caller_key: Optional[Callable[[], str]] = None, **fastmcp_kwargs: Any) -> FastMCP:
     """Build the FastMCP app (usable in-process, e.g. from tests).
 
     bound_identity: remote mode. A callable returning the agent id the current request is
     authenticated as (from its bearer token). Every identity argument (agent_id, asker, author)
     must then be omitted or equal to it, and follow-ups and closing are reserved to the asker.
-    max_text: when > 0, refuse message texts longer than this many characters."""
+    max_text: when > 0, refuse message texts longer than this many characters.
+    caller_key: remote mode with several teams. Returns a key that is unique across teams for the
+    caller (team and agent id); the cap on open gig_wait calls counts per key."""
     if board is None:
         root = root or env_root()
         if not root:
@@ -317,14 +319,15 @@ def build_app(root=None, agent_id: Optional[str] = None, *, poll_s: float = 3.0,
     async def gig_wait(gig_id: str, ctx: Context, timeout_s: int = 45) -> dict:
         """Block (polling every 3 s) until the gig has an answer, up to timeout_s (default 45, max 600), and return it. If the newest block is already an answer you get it at once; after a follow-up it waits for the next one. On timeout it returns timed_out (plus agent_online / agent_note when the agent that should answer looks offline): call it again. Most clients cut a tool call after about 60 s, so raise timeout_s only if yours allows longer (Claude Code does)."""
         who = (default_identity() or "") if bound_identity is not None else ""
-        if who and waiting.get(who, 0) >= MAX_OPEN_WAITS:
+        key = (caller_key() if caller_key is not None else who) if who else ""
+        if key and waiting.get(key, 0) >= MAX_OPEN_WAITS:
             raise Invalid(f"{MAX_OPEN_WAITS} gig_wait calls are already open for {who}",
                           "let one of them return first; to follow many gigs use inbox or sidegig watch --remote")
-        waiting[who] = waiting.get(who, 0) + 1
+        waiting[key] = waiting.get(key, 0) + 1
         try:
             return await wait_loop(gig_id, ctx, timeout_s)
         finally:
-            waiting[who] -= 1
+            waiting[key] -= 1
 
     async def wait_loop(gig_id: str, ctx: Context, timeout_s: int) -> dict:
         start = time.monotonic()

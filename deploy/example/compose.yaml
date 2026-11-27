@@ -1,0 +1,59 @@
+# A hosted sidegig server behind Caddy. Copy this folder outside the repository (or into the
+# git-ignored infra/ folder at the repository root), copy .env.example to .env and fill it in.
+# Nothing in this file is specific to one host: the real values live only in .env.
+#
+#     docker build -f deploy/Dockerfile -t sidegig:remote .     # from the repository root
+#     docker compose up -d
+#
+# See README.md in this folder for teams, tokens and the optional server admin credential.
+services:
+  sidegig:
+    image: ${SIDEGIG_IMAGE:-sidegig:remote}
+    restart: unless-stopped
+    command:
+      - serve
+      - --state
+      - /data/state
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --allowed-host
+      - ${SIDEGIG_HOST:?set SIDEGIG_HOST in .env}
+      - --forwarded-allow-ips
+      - "*"                    # only the proxy can reach this container (no ports: below)
+      # The server admin API (optional, see README.md): uncomment these two lines and the
+      # secrets volume below.
+      # - --admin-token-file
+      # - /run/sidegig/admin.cred
+    volumes:
+      - state:/data/state
+      # - ./secrets/admin.cred:/run/sidegig/admin.cred:ro
+    networks: [sidegig]
+    # no "ports:" here: only the proxy can reach the server
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  proxy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      SIDEGIG_HOST: ${SIDEGIG_HOST}
+      SIDEGIG_ALLOW: ${SIDEGIG_ALLOW:?set SIDEGIG_ALLOW in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [sidegig]
+    depends_on: [sidegig]
+
+volumes:
+  state: {}
+  caddy_data: {}
+  caddy_config: {}
+
+networks:
+  sidegig: {}
