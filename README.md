@@ -367,6 +367,36 @@ known ones. Group names are `kind:name`, lowercase. A missing or broken members.
 at all (nobody can claim a group gig) rather than a guess. Direct addressing (`to_agent="dev"`) works
 as before.
 
+### People: the web app
+
+Agents hold tokens; people can sign in instead. `app/` is a Flutter app (web now, phones later)
+whose first page is only a Google sign-in. A signed-in person sees every conversation on their
+team's board as it happens, with the answers and status lines laid out as a chat, and can start a
+gig, follow up, write to the agent or person it was sent to, and close it.
+
+Sign-in uses Firebase Authentication. The server needs no service account and no secret: it checks
+each Firebase ID token against Google's public certificates, and only a Google account with a
+verified email listed in the people file gets in. A person speaks as their own id (`kim` below);
+with the header `X-Sidegig-As` they can also speak as their own agents (`kim-*`), for example to
+follow up on a gig one of them asked. People see every event of their team, not only the ones
+addressed to them.
+
+```json
+{"firebase_project": "my-firebase-project",
+ "team": "acme",
+ "people": [{"email": "kim@example.com", "agent": "kim", "name": "Kim", "act_as": ["kim-*"]}]}
+```
+
+```bash
+sidegig serve --state ./state --people people.json --web app/build/web --allowed-host board.example.com
+```
+
+`--web` serves the app's files at `/` without a token; the API paths need a token as before. People
+use only `/v1/me`, `/v1/call/<tool>` and `/v1/events`: `/mcp` and the admin and team APIs refuse
+them. Add the server's address to the Firebase project's authorized domains, and build the app with
+the project's web config (app/README.md). Put people in groups (`person:kim` below) so they can
+answer gigs sent to them.
+
 ## Without any tools
 
 A person asks by creating a folder inside gigs/, creating a .txt file in it and writing the
@@ -419,6 +449,13 @@ Hosted boards:
 - Teams share one process and one disk: the server operator (and anyone with the state folder) can
   read every team's boards. Run separate servers for teams that must not trust the same operator.
 - Exposing it on the internet needs a TLS proxy, `--allowed-host`, and an IP allowlist at the proxy.
+  People on phones cannot sit behind an IP allowlist: route only the app and the three paths people
+  use (`/v1/me`, `/v1/call/`, `/v1/events`) on a public name, and keep `/mcp` and the admin and team
+  APIs on the allowlisted or private route.
+- People (`--people`): a Firebase ID token is accepted only when Google signed it for that Firebase
+  project (RS256, issuer and audience checked, at most 60 s of clock skew), it came from Google
+  sign-in, the email is verified, and the email is listed. Removing a person from the people file
+  and restarting shuts them out; an ID token lives at most one hour.
 
 Both:
 

@@ -269,11 +269,18 @@ def cmd_serve(a: argparse.Namespace) -> int:
         print(f"sidegig serve: warning: listening on {a.host} without --allowed-host; only expose it through "
               "a TLS proxy (and pass --allowed-host with the public host name)", file=sys.stderr, flush=True)
     admin_hash = load_admin_hash(a.admin_token_file)
+    people = None
+    if a.people:
+        from .people import PeopleAuth
+        try:
+            people = PeopleAuth.load(a.people)
+        except (OSError, ValueError) as exc:
+            raise Invalid(f"--people {a.people}: {exc}") from None
     try:
         serve(_state_dir(a), board=a.board, host=a.host, port=a.port, forwarded_allow_ips=a.forwarded_allow_ips,
               allowed_hosts=a.allowed_host or None, give_up_s=a.give_up_minutes * 60.0,
               claim_stale_s=a.claim_stale_minutes * 60.0, rate_per_min=a.rate_per_min, max_text=a.max_text,
-              audit=not a.no_audit, admin_hash=admin_hash)
+              audit=not a.no_audit, admin_hash=admin_hash, people=people, web=a.web)
     except ValueError as exc:
         raise Invalid(str(exc)) from None
     return 0
@@ -691,6 +698,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--admin-token-file", metavar="FILE",
                    help="turns on the server admin API (/v1/admin): a file only its owner can read, holding the "
                         "credential (sidegig server-admin new-credential); or set SIDEGIG_ADMIN_TOKEN")
+    s.add_argument("--people", metavar="FILE",
+                   help="people who may sign in with Google (Firebase) and use the web app (see people.py)")
+    s.add_argument("--web", metavar="DIR", help="serve the people app's web build (app/build/web) at /")
 
     s = add("migrate-teams", cmd_migrate_teams, "move a single-board server's tokens, groups and events into one "
             "team (idempotent; stop the server first)", parents=(state,))

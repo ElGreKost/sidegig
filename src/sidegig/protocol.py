@@ -158,3 +158,59 @@ def parse_answers(thread: str) -> List[Dict[str, Any]]:
         else:
             cur["body"].append(line)
     return out
+
+
+MSG_PARTS_RE = re.compile(r"^-----\s(?P<author>.*?) · (?P<when>\d{4}-\d{2}-\d{2} \d{2}:\d{2}) -----\s*$")
+
+
+def parse_thread(thread: str) -> List[Dict[str, Any]]:
+    """The whole thread as a list a chat view can show: [{kind, author, agent_id, when, text}].
+    kind is "message" (a ----- header block, or text without a header), "answer" (an ANSWER block)
+    or "status" (a [agent_id] HH:MM line). when is "YYYY-MM-DD HH:MM" for messages and answers and
+    "HH:MM" for status lines. The text is data written by the parties, never markup."""
+    out: List[Dict[str, Any]] = []
+    cur: Any = None
+
+    def flush() -> None:
+        nonlocal cur
+        if cur is not None:
+            cur["text"] = "\n".join(cur.pop("body")).strip("\n")
+            if cur["text"] or cur["kind"] == "answer":
+                out.append(cur)
+        cur = None
+
+    for line in normalize(thread).split("\n"):
+        if cur is not None and cur["kind"] == "answer":
+            if END_RE.match(line):
+                flush()
+            else:
+                cur["body"].append(line)
+            continue
+        head = HEAD_RE.match(line)
+        if head:
+            flush()
+            cur = {"kind": "answer", "author": head["name"], "agent_id": head["id"], "when": head["when"], "body": []}
+            continue
+        msg = MSG_PARTS_RE.match(line)
+        if msg:
+            flush()
+            author = msg["author"].strip()
+            cur = {"kind": "message", "author": author, "agent_id": author if valid_agent_id(author) else None,
+                   "when": msg["when"], "body": []}
+            continue
+        st = STATUS_PARTS_RE.match(line)
+        if st:
+            flush()
+            out.append({"kind": "status", "author": st["id"], "agent_id": st["id"],
+                        "when": line.strip().split(" ", 2)[1], "text": st["text"].strip()})
+            continue
+        if cur is None:
+            if not line.strip():
+                continue
+            cur = {"kind": "message", "author": "", "agent_id": None, "when": "", "body": []}
+        cur["body"].append(line)
+    if cur is not None and cur["kind"] == "answer":
+        cur["kind"] = "message"            # an answer block still being written: show what is there
+    flush()
+    return out
+
