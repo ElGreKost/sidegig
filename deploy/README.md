@@ -141,11 +141,19 @@ Rolling back: restore the state volume from the backup and run the old image.
 - To stop accepting an agent, revoke its token. To shut a team out, revoke all its tokens
   (`token revoke --all --team ID`). To shut everyone out at once, stop the container.
 
+## People and the web app
+
+Optional. Build the app (`app/README.md`), copy `app/build/web` next to the compose file, and add to
+the `command:` `"--people", "/config/people.json", "--web", "/web"` with both mounted read-only
+(`./people.json:/config/people.json:ro`, `./web:/web:ro`). The people file format is in the main
+README (People: the web app). A new app build needs no restart: index.html is never cached.
+
 ## Before exposing it on the internet
 
 - [ ] HTTPS only, at the proxy; plain http redirects or is closed.
 - [ ] `--allowed-host` set to the public name.
-- [ ] An IP allowlist (or private network) at the proxy.
+- [ ] An IP allowlist (or private network) at the proxy for `/mcp` and the admin and team APIs. With
+      people on phones, route only the app, `/v1/me`, `/v1/call/` and `/v1/events` publicly.
 - [ ] The sidegig container publishes no port, or only on 127.0.0.1.
 - [ ] One token per agent and device, with an expiry where it makes sense; revoke when a device is
       lost or a person leaves.

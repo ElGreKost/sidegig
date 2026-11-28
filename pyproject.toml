@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = ["mcp", "agents", "gig board", "file based"]
-dependencies = ["mcp>=1.10,<2"]
+dependencies = ["mcp>=1.10,<2", "pyjwt[crypto]>=2.8"]
 
 [project.urls]
 Homepage = "https://github.com/ElGreKost/sidegig"

@@ -71,6 +71,7 @@ from .board import Board
 from .errors import BoardError, Invalid
 from .mcp_server import build_app
 from .members import MemberStore
+from .people import PeopleAuth
 from .teams import TeamStore, admin_audit, create_team, inside, legacy_problem
 from .tokens import ADMIN_PREFIX, PREFIX, SERVER_ADMIN, Principal, TokenStore, admin_matches
 
@@ -194,14 +195,18 @@ class EventBus:
         """True when events after `after` were already trimmed from the log."""
         return bool(self.ring) and after + 1 < self.ring[0]["seq"]
 
-    def for_agent(self, agent: str, after: int) -> List[Dict[str, Any]]:
+    def for_agent(self, agent: str, after: int, everything: bool = False) -> List[Dict[str, Any]]:
+        """Events after `after` that concern this agent; with everything=True (a person watching the
+        board in the app) every event of the team, including their own."""
+        if everything:
+            return [e for e in self.ring if e["seq"] > after]
         return [e for e in self.ring if e["seq"] > after and e.get("actor") != agent
                 and ("*" in e["to"] or agent in e["to"])]
 
-    async def wait(self, agent: str, after: int, timeout: float) -> List[Dict[str, Any]]:
+    async def wait(self, agent: str, after: int, timeout: float, everything: bool = False) -> List[Dict[str, Any]]:
         deadline = time.monotonic() + timeout
         while True:
-            found = self.for_agent(agent, after)
+            found = self.for_agent(agent, after, everything)
             left = deadline - time.monotonic()
             if found or left <= 0:
                 return found
@@ -509,6 +514,48 @@ TOKEN_MARKERS = (PREFIX.encode(), ADMIN_PREFIX.encode())
 ADMIN_TOKEN_PATHS = ("/v1/me", "/v1/team/tokens", "/v1/team/tokens/revoke")
 
 
+PERSON_PATHS = ("/v1/me", "/v1/events")
+
+
+def _api_path(path: str) -> bool:
+    """Paths the server itself answers; with --web every other path is a file of the people app."""
+    return path in ("/v1", "/mcp", "/healthz") or path.startswith(("/v1/", "/mcp/"))
+
+
+class WebApp:
+    """The people app's static files (a Flutter web build), with headers that keep it out of frames
+    and keep the address out of referrers. index.html is never cached, so a new build shows at once."""
+
+    def __init__(self, directory) -> None:
+        from starlette.staticfiles import StaticFiles
+        if not (Path(directory) / "index.html").is_file():
+            raise ValueError(f"--web {directory}: no index.html there (point it at the app's build/web)")
+        self.files = StaticFiles(directory=str(directory), html=True)
+
+    async def __call__(self, scope, receive, send):
+        if scope["method"] not in ("GET", "HEAD"):
+            return await JSONResponse({"ok": False, "error": "not found", "code": "NotFound"}, 404)(scope, receive,
+                                                                                                    send)
+        path = scope["path"]
+
+        async def send_headers(message):
+            if message["type"] == "http.response.start":
+                extra = [(b"x-content-type-options", b"nosniff"), (b"x-frame-options", b"DENY"),
+                         (b"referrer-policy", b"no-referrer")]
+                if path in ("/", "/index.html") or path.endswith(("flutter_service_worker.js", "version.json",
+                                                                   "flutter_bootstrap.js")):
+                    extra.append((b"cache-control", b"no-cache"))
+                message = {**message, "headers": list(message.get("headers", [])) + extra}
+            await send(message)
+
+        from starlette.exceptions import HTTPException
+        try:
+            await self.files(scope, receive, send_headers)
+        except HTTPException as exc:
+            await JSONResponse({"ok": False, "error": "not found", "code": "NotFound"},
+                               exc.status_code if exc.status_code in (404, 405) else 404)(scope, receive, send)
+
+
 def _odd_path(path: str) -> bool:
     """Paths no client sends: empty or dot segments, which could otherwise slip past a prefix check."""
     return "//" in path or "/./" in path or "/../" in path or path.endswith(("/.", "/..")) or "\\" in path
@@ -529,8 +576,10 @@ def _role_refusal(p: Principal, path: str) -> str:
 class Gate:
     def __init__(self, app, hub: Hub, limiter: RateLimit, audit: AuditLog, max_body: int,
                  allowed_hosts: Optional[List[str]] = None, admin_hash: Optional[str] = None,
-                 fail_limiter: Optional[RateLimit] = None):
+                 fail_limiter: Optional[RateLimit] = None, people: Optional[PeopleAuth] = None,
+                 web_app=None):
         self.app, self.hub, self.limiter, self.audit, self.max_body = app, hub, limiter, audit, max_body
+        self.people, self.web_app = people, web_app
         self.allowed_hosts = list(allowed_hosts or [])
         self.admin_hash = admin_hash
         self.fail_limiter = fail_limiter or RateLimit(60, 20)
@@ -540,6 +589,20 @@ class Gate:
         if row is not None:
             self.audit.write({**row, "status": status, "error": error})
         await JSONResponse({"ok": False, "error": error, "code": code}, status, headers=extra)(scope, receive, send)
+
+    def _person(self, path: str, bearer: str, headers: Dict[str, str]) -> Tuple[Optional[Principal], int, str]:
+        """A person signed in with Google (people.py): (principal, 0, "") or (None, status, why)."""
+        person, why = self.people.verify(bearer)
+        if person is None:
+            return None, 401, why
+        if path not in PERSON_PATHS and not path.startswith("/v1/call/"):
+            return None, 403, "people use the board API (/v1/me, /v1/call, /v1/events) only"
+        want = (headers.get("x-sidegig-as") or "").strip().lower() or person.agent
+        if not P.valid_agent_id(want) or not person.may_speak_as(want):
+            return None, 403, f"{person.email} may not speak as {want[:64]}"
+        if self.hub.teams.get(person.team) is None:
+            return None, 401, "this person's team does not exist"
+        return Principal(team=person.team, name=want, role="member", token_id=f"person:{person.agent}"), 0, ""
 
     def _principal(self, path: str, bearer: str) -> Optional[Principal]:
         if path == "/v1/admin" or path.startswith("/v1/admin/"):
@@ -573,14 +636,26 @@ class Gate:
                                      "Authorization header", row, code="Invalid")
         if (path == "/v1/admin" or path.startswith("/v1/admin/")) and not self.admin_hash:
             return await self._reply(scope, receive, send, 404, "not found", row, code="NotFound")
+        if self.web_app is not None and not _api_path(path):
+            return await self.web_app(scope, receive, send)        # the people app's files: no token
         auth = headers.get("authorization", "")
         bearer = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-        principal = self._principal(path, bearer)
+        refused, why = 401, "missing, unknown, expired or revoked token"
+        if (self.people is not None and not bearer.startswith((PREFIX, ADMIN_PREFIX))
+                and not path.startswith("/v1/admin") and self.people.looks_like_id_token(bearer)):
+            principal, status_code, reason = self._person(path, bearer, headers)
+            if principal is None:
+                refused, why = status_code, reason
+                if status_code == 403:
+                    row["agent"] = "person"
+                    return await self._reply(scope, receive, send, 403, why, row)
+        else:
+            principal = self._principal(path, bearer)
         if principal is None:
             if not self.fail_limiter.allow("ip:" + str(row["ip"])):
                 return await self._reply(scope, receive, send, 429, "too many refused requests: slow down", None,
                                          {"Retry-After": "30"})
-            return await self._reply(scope, receive, send, 401, "missing, unknown, expired or revoked token", row,
+            return await self._reply(scope, receive, send, refused, why, row,
                                      {"WWW-Authenticate": 'Bearer realm="sidegig"'})
         row.update({"team": principal.team or None, "agent": principal.name, "token": principal.token_id})
         refusal = _role_refusal(principal, path)
@@ -697,7 +772,7 @@ def build_remote_app(state, *, board=None, audit: bool = True, max_body: int = 6
                      clock: Optional[Callable[[], float]] = None, poll_s: float = 3.0,
                      claim_stale_s: float = 600, give_up_s: float = 4 * 3600, sweep_s: float = 30.0,
                      keep_events: int = 5000, max_waits: int = 4, admin_hash: Optional[str] = None,
-                     fail_per_min: float = 60) -> Gate:
+                     fail_per_min: float = 60, people: Optional[PeopleAuth] = None, web=None) -> Gate:
     """The ASGI app for every team in the state folder (created, mode 700). Each request's token
     decides its team, and the team decides the board: nothing in a request names a team.
 
@@ -705,7 +780,8 @@ def build_remote_app(state, *, board=None, audit: bool = True, max_body: int = 6
     of a team already, else this refuses and names the migration command. A state folder that still
     holds single-board data is refused the same way. give_up_s is the claim lease (4 h by default
     here: department work can be long). max_waits caps one agent's simultaneous long polls.
-    admin_hash: the SHA-256 of the server admin credential; without it /v1/admin answers 404."""
+    admin_hash: the SHA-256 of the server admin credential; without it /v1/admin answers 404.
+    people: who may sign in with Google (people.py); web: the people app's build folder, served at /."""
     from mcp.server.fastmcp.exceptions import ToolError
     from mcp.server.transport_security import TransportSecuritySettings
 
@@ -765,7 +841,7 @@ def build_remote_app(state, *, board=None, audit: bool = True, max_body: int = 6
             return _err(429, f"more than {max_waits} long polls open for {p.name}", "close the others first", "busy")
         ts.waits[p.name] = ts.waits.get(p.name, 0) + 1
         try:
-            found = await ts.bus.wait(p.name, after, wait)
+            found = await ts.bus.wait(p.name, after, wait, everything=p.token_id.startswith("person:"))
         finally:
             ts.waits[p.name] -= 1
         return JSONResponse({"ok": True, "boot": ts.bus.boot, "events": found, "gap": ts.bus.gap(after),
@@ -779,6 +855,11 @@ def build_remote_app(state, *, board=None, audit: bool = True, max_body: int = 6
         if p.is_member and ts is not None:
             out.update({"groups": ts.board.groups_of(p.name), "boot": ts.bus.boot, "seq": ts.bus.seq,
                         **ts.board.limits()})
+            person = people.by_agent(p.token_id[len("person:"):]) if people and p.token_id.startswith("person:") else None
+            if person is not None:
+                known = [a.get("id", "") for a in ts.board.agents()]
+                out.update({"person": {"email": person.email, "name": person.name, "agent": person.agent},
+                            "can_act_as": person.speakable(known)})
         return JSONResponse(out)
 
     async def call(request: Request) -> Response:
@@ -931,6 +1012,12 @@ def build_remote_app(state, *, board=None, audit: bool = True, max_body: int = 6
             hub.started = True
             for team in teams.ids():
                 hub.get(team)                   # load, make profiles, take stock
+            for person in (people.people.values() if people else []):
+                ts = hub.get(person.team)       # a person can be written to before they first sign in
+                if ts is not None and not (ts.board.agents_dir / f"{person.agent}.json").is_file():
+                    with contextlib.suppress(Exception):
+                        ts.board.ensure_agent(person.agent, name=person.name, owner=person.agent,
+                                              description="A person: reads and writes in the sidegig app")
             task = asyncio.create_task(sweeper()) if sweep_s > 0 else None
             try:
                 yield
@@ -952,7 +1039,8 @@ def build_remote_app(state, *, board=None, audit: bool = True, max_body: int = 6
                     lifespan=lambda _app: lifespan())
     gate = Gate(app, hub, RateLimit(rate_per_min, burst), AuditLog(state / "audit.jsonl" if audit else None),
                 max_body, allowed_hosts=allowed_hosts, admin_hash=admin_hash,
-                fail_limiter=RateLimit(fail_per_min, max(5.0, fail_per_min / 3)))
+                fail_limiter=RateLimit(fail_per_min, max(5.0, fail_per_min / 3)), people=people,
+                web_app=WebApp(web) if web else None)
     gate.hub, gate.lifespan, gate.team = hub, lifespan, hub.get     # for tests and the CLI
     return gate
 
